@@ -1,12 +1,16 @@
-// ESPLeafSOC_v01.ino
-// ==================
+// ESPLeafSOC.ino
+// ==============
 // ESP32 / LilyGo T-CAN485 refactor of Paul Kennett's LeafSOCdisplay
 // Original project: https://github.com/PaulKennett/LeafSOCdisplay
 // This fork:        https://github.com/Mozzie-AU/ESPLeafSOC
 //
+// Authors:
+//   Ray (Mozzie-AU) - hardware build, testing, project direction
+//   Claude (Anthropic AI) - ESP32 refactor, code architecture assistance
+//
 // Key changes from original Arduino Nano version:
 //   - ESP32 native TWAI CAN controller replaces external MCP2515 SPI module
-//   - OLED switched from SPI to I2C
+//   - OLED retains SPI interface (hardware jumpered on existing installs)
 //   - Settings (page, km/kWh, pack type) via WiFi web portal replaces HVAC button UI
 //   - Settings stored in ESP32 NVS (Preferences) replaces Arduino EEPROM
 //   - uint16_t maxGids replaces byte - supports 30/40/62kWh packs
@@ -19,23 +23,31 @@
 //   CAN TX:  GPIO27 (required by TWAI driver but not driven - listen-only mode)
 //   CAN RX:  GPIO26
 //   CAN SE:  GPIO23 (SN65HVD231 silent/enable - must be driven LOW to enable RX)
-//   WS2812:  GPIO4
-//   I2C SDA: GPIO32 (12-pin IO header)
-//   I2C SCL: GPIO33 (12-pin IO header)
+//   WS2812:  GPIO4  (onboard RGB LED)
+//   OLED SPI (hardware SPI, 12-pin IO header):
+//     CLK:   GPIO33
+//     MOSI:  GPIO32
+//     CS:    GPIO25
+//     DC:    GPIO18
+//     RST:   GPIO35
 //
 // Libraries required:
-//   U8g2         - OLED display (https://github.com/olikraus/u8g2)
+//   U8g2          - OLED display (https://github.com/olikraus/u8g2)
 //   ESPAsyncWebServer + AsyncTCP - WiFi config portal
-//   Preferences  - NVS storage (built into ESP32 Arduino core)
-//   FastLED      - WS2812 LED
+//   Preferences   - NVS storage (built into ESP32 Arduino core)
+//   FastLED       - WS2812 LED
 //   driver/twai.h - CAN bus (built into ESP32 Arduino core)
+//
+// Changelog:
+//   v01 - Initial ESP32/T-CAN485 skeleton. I2C OLED (superseded)
+//   v02 - Switch OLED to hardware SPI. Dual constructor (SH1106/SSD1306).
+//         Added Claude contribution note.
 
 // ============================================================
-// TODO before this compiles:
-//   1. Verify U8G2 I2C constructor matches your OLED driver (SH1106 vs SSD1306)
-//   2. Install ESPAsyncWebServer and AsyncTCP libraries
-//   3. Install FastLED library
-//   4. Verify GIDS decode bit-shift for 0x5BC matches your Leaf model year
+// TODO:
+//   1. Verify GIDS decode bit-shift for 0x5BC matches your Leaf model year
+//   2. Implement auto-learn MaxGids update logic in processCanMessage()
+//   3. Research and verify exact MaxGids values for 30/40/62kWh packs
 // ============================================================
 
 #include <Arduino.h>
@@ -43,7 +55,7 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <U8g2lib.h>
-#include <Wire.h>
+#include <SPI.h>
 #include <FastLED.h>
 #include "driver/twai.h"
 #include "battery_large.h"
@@ -52,18 +64,21 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v01"
+#define VERSION   "ESPLeafSOC v02"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
 // ------------------------------------------------------------
-// Hardware pin definitions  (confirmed from LilyGO T-CAN485 pinout diagram)
+// Hardware pin definitions (confirmed from LilyGO T-CAN485 pinout diagram)
 // ------------------------------------------------------------
 #define CAN_TX_PIN      27    // Required by TWAI driver - not actively driven (listen-only)
 #define CAN_RX_PIN      26    // CAN RX
 #define CAN_SE_PIN      23    // SN65HVD231 silent/enable - drive LOW to enable transceiver
-#define I2C_SDA_PIN     32    // 12-pin IO header
-#define I2C_SCL_PIN     33    // 12-pin IO header
+#define OLED_CLK_PIN    33    // SPI clock  (12-pin IO header)
+#define OLED_MOSI_PIN   32    // SPI data   (12-pin IO header)
+#define OLED_CS_PIN     25    // SPI chip select (12-pin IO header)
+#define OLED_DC_PIN     18    // Data/command    (12-pin IO header)
+#define OLED_RST_PIN    35    // Reset           (12-pin IO header)
 #define WS2812_PIN      4     // Onboard WS2812B RGB LED
 #define WS2812_COUNT    1
 
@@ -99,13 +114,22 @@
 #define NVS_MAX_GIDS    "maxgids"
 
 // ------------------------------------------------------------
-// Display
+// Display constructor
 // ------------------------------------------------------------
-// SH1106 128x64 I2C - adjust constructor if using SSD1306
+// Hardware SPI - CLK=33, MOSI=32, CS=25, DC=18, RST=35
 // U8G2_R0 = no rotation, U8G2_R2 = 180 degrees (match your physical mount)
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, /* reset=*/ U8X8_PIN_NONE,
-                                          /* clock=*/ I2C_SCL_PIN,
-                                          /* data=*/  I2C_SDA_PIN);
+//
+// Uncomment the line matching your display's driver chip.
+// Existing Keyestudio installs: SH1106 (default)
+// Seeedstudio and some others:  SSD1306
+
+// SH1106 128x64 SPI - Keyestudio KS0056 and compatible (DEFAULT)
+U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R2,
+  /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
+
+// SSD1306 128x64 SPI - Seeedstudio and compatible (uncomment if needed)
+// U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R2,
+//   /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
 
 // ------------------------------------------------------------
 // LED
@@ -191,9 +215,7 @@ void setup() {
   // Load settings from NVS
   loadSettings();
 
-  // OLED init
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(100000);  // 100kHz for reliable operation over ~500mm cable
+  // OLED init - hardware SPI
   u8g2.begin();
   u8g2.setFont(u8g2_font_logisoso16_tr);
 
