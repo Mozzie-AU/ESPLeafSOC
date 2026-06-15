@@ -54,6 +54,21 @@
 //         Vertical "km" stacked beside range number on page 1.
 //         LINE1-4 defines added, shifted up 6px to avoid defective bottom pixel rows.
 //         battery_small.h added for page 1 outline graphic.
+//   v06 - Complete page layout rewrite based on actual display testing.
+//         Page 1: fixed overlap between range number, battery graphic, SOC%, kWh.
+//         Page 2: battery_large confirmed 128x41px, SOC% inside, % smaller font,
+//                 kWh below at y=56.
+//         Page 3: Range/km labels top, large number centred at y=54.
+//   v07 - Page 1: SOC% and kWh side by side on single bottom line (y=62).
+//         Page 2: fixed duplicate % bug, kWh dropped to y=62.
+//         Page 3: range number dropped to y=62.
+//         Full 64px vertical restored (second OLED has no defective bottom rows).
+//   v08 - Fixed test mode display artifacts (thread safety).
+//         updateDisplay() no longer called from async web handler.
+//         displayNeedsUpdate flag used instead - main loop handles display updates.
+//         testMode loop update rate limited to 100ms to avoid hammering display.
+//   v09 - Page 2: % symbol switched to 6x10 small font, repositioned to x=90,y=28
+//         to sit cleanly inside battery outline without overlap or glyph artifacts.
 
 // ============================================================
 // TODO:
@@ -78,7 +93,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v05"
+#define VERSION   "ESPLeafSOC v09"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -203,8 +218,10 @@ uint16_t maxGids        = PACK_24KWH_GIDS;  // overwritten from NVS on boot
 int      displayRotation = 2;     // 0 = normal, 2 = 180 degrees (U8G2_R0 / U8G2_R2)
 
 // Test mode - cycles display pages for layout checking (not saved to NVS)
-bool     testMode       = false;
-int      testPage       = 1;
+bool     testMode          = false;
+int      testPage          = 1;
+bool     displayNeedsUpdate = false;   // set by web handlers, actioned by main loop
+unsigned long testLastUpdate = 0;      // rate limit test mode display updates
 
 // ------------------------------------------------------------
 // Web server
@@ -298,8 +315,17 @@ void loop() {
     }
   }
 
-  // Update display when GIDS changes, or in test mode always update
-  if (rawGids != rawGids2 || testMode) {
+  // Update display:
+  //   - when GIDS value changes (normal operation)
+  //   - when web handler sets displayNeedsUpdate flag (test mode / settings saved)
+  //   - in test mode, refresh at 100ms rate so page shows promptly after Next Page tap
+  unsigned long now = millis();
+  bool timeToUpdate = (rawGids != rawGids2)
+                   || displayNeedsUpdate
+                   || (testMode && (now - testLastUpdate > 100));
+  if (timeToUpdate) {
+    displayNeedsUpdate = false;
+    testLastUpdate = now;
     updateDisplay();
     rawGids2 = rawGids;
   }
@@ -519,6 +545,7 @@ void initWifi() {
       if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
     }
     saveSettings();
+    displayNeedsUpdate = true;       // main loop handles display refresh
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
       "<h2 style='color:#2a6'>Settings Saved</h2>"
@@ -530,7 +557,7 @@ void initWifi() {
   server.on("/test", HTTP_POST, [](AsyncWebServerRequest* request) {
     testMode = true;
     testPage = (testPage % 4) + 1;  // cycle 1->2->3->4->1
-    updateDisplay();
+    displayNeedsUpdate = true;       // main loop handles actual display update
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
       "<h2 style='color:#a62'>Test Mode - Page " + String(testPage) + "</h2>"
@@ -542,7 +569,7 @@ void initWifi() {
   server.on("/testoff", HTTP_POST, [](AsyncWebServerRequest* request) {
     testMode = false;
     testPage = 1;
-    updateDisplay();
+    displayNeedsUpdate = true;       // main loop handles actual display update
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
       "<h2 style='color:#2a6'>Test Mode Off</h2>"
@@ -579,20 +606,24 @@ void updateDisplay() {
 }
 
 void drawPage1() {
-  // Range + SOC% + kWh
-  // Based on Paul Kennett's original layout with these changes:
-  //   - battery_small (outline) instead of battery_solid
-  //   - "km" drawn vertically beside range number to save horizontal space
-  //   - LINE3 raised to avoid defective bottom pixel rows
+  // Layout (128x64 display, avoid bottom 6px):
+  //   Row 0-16:  "Range" label (logisoso16, baseline y=16)
+  //   Row 0-38:  Large range number (logisoso32, baseline y=38)
+  //   Row 0-32:  Vertical "km" small font (y=22, y=32)
+  //   Row 40-63: battery_small graphic (56x24px, top-left)
+  //   Row 46-58: SOC% right of battery (logisoso16, baseline y=58)
+  //   Row 46-58: kWh right of battery (logisoso16, baseline y=58) -- too wide, use small font
   char buf[8];
   u8g2.clearBuffer();
 
-  // Battery outline graphic - bottom left
-  u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
+  // "Range" label top left - medium font
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  u8g2.setCursor(0, 16);
+  u8g2.print("Range");
 
-  // Large range number - shifted right slightly to make room for vertical km
+  // Large range number - centre top area
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(45, 38);
+  u8g2.setCursor(38, 38);
   if (rawGids != 0) {
     dtostrf(range, 3, 0, buf);
     u8g2.print(buf);
@@ -600,74 +631,103 @@ void drawPage1() {
     u8g2.print(" --");
   }
 
-  // "Range" label - medium font top left
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, LINE1);
-  u8g2.print("Range");
-
-  // "km" stacked vertically - medium font, right of range number
+  // "km" stacked vertically right edge
   u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(118, 20);
+  u8g2.setCursor(120, 20);
   u8g2.print("k");
-  u8g2.setCursor(118, 32);
+  u8g2.setCursor(120, 32);
   u8g2.print("m");
 
-  // SOC% - medium font, bottom centre
+  // Battery outline graphic bottom left (56x24 starting at y=40)
+  u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
+
+  // SOC% and kWh side by side on bottom line
+  // Bottom right quadrant: x=58-128, y=40-64
+  // logisoso16 for SOC%, small font for kWh to fit on one line at y=62
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(58, LINE3);
+  u8g2.setCursor(58, 62);
   if (rawGids != 0) {
     dtostrf(GidsPct, 3, 0, buf);
     u8g2.print(buf);
+    u8g2.print("%");
   } else {
-    u8g2.print(" --");
+    u8g2.print("--%");
   }
-  u8g2.print("%");
-
-  // kWh - medium font, bottom right
-  u8g2.setCursor(kWh >= 10 ? 58 : 68, LINE4);
-  dtostrf(kWh, 3, 1, buf);
-  u8g2.print(buf);
-  u8g2.print("kWh");
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(96, 62);
+  if (rawGids != 0) {
+    dtostrf(kWh, 4, 1, buf);
+    u8g2.print(buf);
+    u8g2.print("k");
+  } else {
+    u8g2.print("-.--k");
+  }
 
   u8g2.sendBuffer();
 }
 
 void drawPage2() {
-  // Large SOC% inside battery graphic + kWh
+  // battery_large is 128x41px - draws from y=0 to y=40
+  // SOC% number centred inside battery outline
+  // kWh below battery graphic, clear of bottom defects
   char buf[8];
   u8g2.clearBuffer();
+
+  // Battery large outline graphic - full width, top of screen
   u8g2.drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
+
+  // SOC% inside battery - logisoso26 numerals, % in smaller font
+  // Battery interior roughly x=10 to x=118, y=4 to y=37
   u8g2.setFont(u8g2_font_logisoso26_tn);
-  u8g2.setCursor(41, 33);
+  u8g2.setCursor(28, 32);
   if (rawGids != 0) {
-    dtostrf(GidsPct, 3, 0, buf); u8g2.print(buf);
+    dtostrf(GidsPct, 3, 0, buf);
+    u8g2.print(buf);
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.setCursor(90, 28);
+    u8g2.print("%");
   } else {
     u8g2.print(" --");
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.setCursor(90, 28);
+    u8g2.print("%");
   }
+
+  // kWh below battery - medium font, y=62 now full 64px available
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(30, LINE3);  // raised from 64 to LINE3=54
+  u8g2.setCursor(20, 62);
   if (rawGids != 0) {
-    dtostrf(kWh, 3, 1, buf); u8g2.print(buf); u8g2.print(" kWh");
+    dtostrf(kWh, 4, 1, buf);
+    u8g2.print(buf);
+    u8g2.print(" kWh");
   } else {
-    u8g2.print("-- kWh");
+    u8g2.print(" --.- kWh");
   }
   u8g2.sendBuffer();
 }
 
 void drawPage3() {
-  // Range only - large centred display
+  // Range only - large number centre screen
+  // "Range" top left, "km" top right, large number centre
   char buf[8];
   u8g2.clearBuffer();
+
+  // "Range" top left, "km" top right - medium font, baseline y=16
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  u8g2.setCursor(0, 16);
+  u8g2.print("Range");
+  u8g2.setCursor(103, 16);
+  u8g2.print("km");
+
+  // Large range number - full 64px available, baseline y=62
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(39, 44);
+  u8g2.setCursor(22, 62);
   if (rawGids != 0) {
-    dtostrf(range, 3, 0, buf); u8g2.print(buf);
+    dtostrf(range, 3, 0, buf);
+    u8g2.print(buf);
   } else {
     u8g2.print(" --");
   }
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, LINE2);    u8g2.print("Range");
-  u8g2.setCursor(103, LINE2);  u8g2.print("km");
   u8g2.sendBuffer();
 }
 
