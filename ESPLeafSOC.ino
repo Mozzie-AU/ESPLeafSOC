@@ -29,7 +29,7 @@
 //     MOSI:  GPIO32
 //     CS:    GPIO25
 //     DC:    GPIO18
-//     RST:   GPIO35
+//     RST:   GPIO5 (IO05) - GPIO35 is input-only on ESP32
 //
 // Libraries required:
 //   U8g2          - OLED display (https://github.com/olikraus/u8g2)
@@ -41,7 +41,19 @@
 // Changelog:
 //   v01 - Initial ESP32/T-CAN485 skeleton. I2C OLED (superseded)
 //   v02 - Switch OLED to hardware SPI. Dual constructor (SH1106/SSD1306).
-//         Added Claude contribution note.
+//         Added Claude contribution note. SPI.begin() fix for custom pins.
+//   v03 - Runtime display rotation (0/180) in web portal and NVS.
+//         Vertical "km" label on page 1 to save horizontal space.
+//         Smaller font for splash screen / page 4.
+//         Test mode in web portal - cycle through display pages.
+//         RST pin confirmed GPIO5 (GPIO35 is input-only on ESP32).
+//   v04 - WiFi portal stays alive while client connected, 60s timeout after last disconnect.
+//         mDNS added - portal accessible at http://espleafsoc.local
+//         Splash screen line spacing tightened to fit github URL in 64px.
+//   v05 - Page 1 restored to Paul's original layout with logisoso16 fonts for SOC%/kWh.
+//         Vertical "km" stacked beside range number on page 1.
+//         LINE1-4 defines added, shifted up 6px to avoid defective bottom pixel rows.
+//         battery_small.h added for page 1 outline graphic.
 
 // ============================================================
 // TODO:
@@ -54,19 +66,30 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <ESPmDNS.h>
 #include <U8g2lib.h>
 #include <SPI.h>
 #include <FastLED.h>
 #include "driver/twai.h"
 #include "battery_large.h"
 #include "battery_solid.h"
+#include "battery_small.h"
 
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v02"
+#define VERSION   "ESPLeafSOC v05"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
+
+// ------------------------------------------------------------
+// Display line positions (Y pixel, U8G2 baseline)
+// Kept 6px clear of bottom to avoid defective pixel rows on some modules
+// ------------------------------------------------------------
+#define LINE1  16
+#define LINE2  36
+#define LINE3  54
+#define LINE4  58
 
 // ------------------------------------------------------------
 // Hardware pin definitions (confirmed from LilyGO T-CAN485 pinout diagram)
@@ -78,7 +101,7 @@
 #define OLED_MOSI_PIN   32    // SPI data   (12-pin IO header)
 #define OLED_CS_PIN     25    // SPI chip select (12-pin IO header)
 #define OLED_DC_PIN     18    // Data/command    (12-pin IO header)
-#define OLED_RST_PIN    35    // Reset           (12-pin IO header)
+#define OLED_RST_PIN    5     // Changed from 35 - GPIO35 is input-only on ESP32
 #define WS2812_PIN      4     // Onboard WS2812B RGB LED
 #define WS2812_COUNT    1
 
@@ -112,6 +135,7 @@
 #define NVS_KM_PER_KWH  "kmkwh"
 #define NVS_PACK_TYPE   "packtype"
 #define NVS_MAX_GIDS    "maxgids"
+#define NVS_ROTATION    "rotation"
 
 // ------------------------------------------------------------
 // Display constructor
@@ -123,12 +147,19 @@
 // Existing Keyestudio installs: SH1106 (default)
 // Seeedstudio and some others:  SSD1306
 
+// Display rotation is now set at runtime from NVS via u8g2.setDisplayRotation()
+// Constructor always uses U8G2_R0 - rotation applied in setup() after loadSettings()
+//
+// Uncomment the line matching your display's driver chip.
+// Existing Keyestudio installs: SH1106 (default)
+// Seeedstudio and some others:  SSD1306
+
 // SH1106 128x64 SPI - Keyestudio KS0056 and compatible (DEFAULT)
-U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R2,
+U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
   /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
 
 // SSD1306 128x64 SPI - Seeedstudio and compatible (uncomment if needed)
-// U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R2,
+// U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
 //   /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
 
 // ------------------------------------------------------------
@@ -165,10 +196,15 @@ unsigned long lastCanRxTime = 0;
 // ------------------------------------------------------------
 Preferences prefs;
 
-int      displayPage  = 1;
-float    kmPerKwh     = 6.4F;
-int      packType     = 1;       // 1=24kWh, 2=30kWh, 3=40kWh, 4=62kWh
-uint16_t maxGids      = PACK_24KWH_GIDS;  // overwritten from NVS on boot
+int      displayPage    = 1;
+float    kmPerKwh       = 6.4F;
+int      packType       = 1;       // 1=24kWh, 2=30kWh, 3=40kWh, 4=62kWh
+uint16_t maxGids        = PACK_24KWH_GIDS;  // overwritten from NVS on boot
+int      displayRotation = 2;     // 0 = normal, 2 = 180 degrees (U8G2_R0 / U8G2_R2)
+
+// Test mode - cycles display pages for layout checking (not saved to NVS)
+bool     testMode       = false;
+int      testPage       = 1;
 
 // ------------------------------------------------------------
 // Web server
@@ -215,15 +251,20 @@ void setup() {
   // Load settings from NVS
   loadSettings();
 
-  // OLED init - hardware SPI
+  // OLED init - hardware SPI on custom pins
+  SPI.begin(OLED_CLK_PIN, -1, OLED_MOSI_PIN, OLED_CS_PIN);
   u8g2.begin();
-  u8g2.setFont(u8g2_font_logisoso16_tr);
+  // Apply rotation from NVS setting (0=normal, 2=180 degrees)
+  u8g2.setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
 
-  // Splash screen
+  // Splash screen - 12px line spacing fits 5 lines within 64px height
   u8g2.clearBuffer();
-  u8g2.setCursor(0, 16); u8g2.print(VERSION);
-  u8g2.setCursor(0, 38); u8g2.print(DATE);
-  u8g2.setCursor(0, 60); u8g2.print(AUTHOR);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(0, 10);  u8g2.print(VERSION);
+  u8g2.setCursor(0, 22);  u8g2.print("Original: Paul Kennett");
+  u8g2.setCursor(0, 34);  u8g2.print(DATE);
+  u8g2.setCursor(0, 46);  u8g2.print(AUTHOR);
+  u8g2.setCursor(0, 58);  u8g2.print("github.com/Mozzie-AU");
   u8g2.sendBuffer();
 
   // Start WiFi config portal
@@ -239,9 +280,14 @@ void setup() {
 // MAIN LOOP
 // ============================================================
 void loop() {
-  // Close WiFi portal after timeout
-  if (wifiActive && (millis() - wifiStartTime > WIFI_PORTAL_TIMEOUT_S * 1000UL)) {
-    stopWifi();
+  // Close WiFi portal after timeout - but only when no clients connected
+  if (wifiActive) {
+    if (WiFi.softAPgetStationNum() > 0) {
+      // Client connected - reset timeout
+      wifiStartTime = millis();
+    } else if (millis() - wifiStartTime > WIFI_PORTAL_TIMEOUT_S * 1000UL) {
+      stopWifi();
+    }
   }
 
   // Read CAN messages
@@ -252,8 +298,8 @@ void loop() {
     }
   }
 
-  // Update display when GIDS changes
-  if (rawGids != rawGids2) {
+  // Update display when GIDS changes, or in test mode always update
+  if (rawGids != rawGids2 || testMode) {
     updateDisplay();
     rawGids2 = rawGids;
   }
@@ -292,10 +338,14 @@ void loadSettings() {
   // Safety check - if stored value is wildly out of range, reset to seed
   if (maxGids < 100 || maxGids > 600) maxGids = seedGids;
 
+  // Load display rotation (0=normal, 2=180 degrees) - default 2 for existing installs
+  displayRotation = prefs.getInt(NVS_ROTATION, 2);
+  if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
+
   prefs.end();
 
-  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f packType=%d maxGids=%d\n",
-                displayPage, kmPerKwh, packType, maxGids);
+  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f packType=%d maxGids=%d rotation=%d\n",
+                displayPage, kmPerKwh, packType, maxGids, displayRotation);
 }
 
 void saveSettings() {
@@ -304,7 +354,10 @@ void saveSettings() {
   prefs.putFloat(NVS_KM_PER_KWH, kmPerKwh);
   prefs.putInt(NVS_PACK_TYPE, packType);
   prefs.putUShort(NVS_MAX_GIDS, maxGids);
+  prefs.putInt(NVS_ROTATION, displayRotation);
   prefs.end();
+  // Apply new rotation immediately without reboot
+  u8g2.setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
   ledState = LED_SAVED;
   Serial.println("Settings saved to NVS");
 }
@@ -369,6 +422,14 @@ void initWifi() {
   Serial.printf("WiFi AP started: SSID=%s IP=%s\n",
                 WIFI_SSID, WiFi.softAPIP().toString().c_str());
 
+  // Start mDNS - portal accessible at http://espleafsoc.local
+  if (MDNS.begin("espleafsoc")) {
+    Serial.println("mDNS started: http://espleafsoc.local");
+    MDNS.addService("http", "tcp", 80);
+  } else {
+    Serial.println("mDNS start failed - use 192.168.4.1");
+  }
+
   // Serve config page
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     String html = "<!DOCTYPE html><html><head>"
@@ -405,11 +466,33 @@ void initWifi() {
       "</select>"
       "<div class='info'>Sets initial MaxGIDS. Auto-learn will refine this over time.</div>"
 
+      "<label>Display Rotation</label>"
+      "<select name='rotation'>"
+      "<option value='2'" + String(displayRotation==2?" selected":"") + ">180° (default - existing installs)</option>"
+      "<option value='0'" + String(displayRotation==0?" selected":"") + ">0° (normal)</option>"
+      "</select>"
+      "<div class='info'>Match your physical display mount orientation.</div>"
+
       "<div class='info' style='margin-top:16px'>Current learned MaxGIDS: <b>"
       + String(maxGids) + "</b></div>"
 
       "<input type='submit' value='Save Settings'>"
-      "</form></body></html>";
+      "</form>"
+
+      "<hr style='margin-top:24px'>"
+      "<h3>Display Test Mode</h3>"
+      "<p class='info'>Cycle through display pages to check layout. "
+      "Test mode is active while WiFi portal is open.</p>"
+      "<form action='/test' method='POST' style='display:inline'>"
+      "<button style='background:#a62;color:#fff;border:none;padding:10px 20px;"
+      "border-radius:4px;cursor:pointer;font-size:1em'>Next Page (now: "
+      + String(testMode ? testPage : displayPage) + ")</button>"
+      "</form>"
+      "<form action='/testoff' method='POST' style='display:inline;margin-left:10px'>"
+      "<button style='background:#666;color:#fff;border:none;padding:10px 20px;"
+      "border-radius:4px;cursor:pointer;font-size:1em'>Exit Test</button>"
+      "</form>"
+      "</body></html>";
     request->send(200, "text/html", html);
   });
 
@@ -431,11 +514,39 @@ void initWifi() {
         }
       }
     }
+    if (request->hasParam("rotation", true)) {
+      displayRotation = request->getParam("rotation", true)->value().toInt();
+      if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
+    }
     saveSettings();
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
       "<h2 style='color:#2a6'>Settings Saved</h2>"
       "<p>Device will use new settings immediately.</p>"
+      "<a href='/'>Back</a></body></html>");
+  });
+
+  // Test mode - advance to next page
+  server.on("/test", HTTP_POST, [](AsyncWebServerRequest* request) {
+    testMode = true;
+    testPage = (testPage % 4) + 1;  // cycle 1->2->3->4->1
+    updateDisplay();
+    request->send(200, "text/html",
+      "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
+      "<h2 style='color:#a62'>Test Mode - Page " + String(testPage) + "</h2>"
+      "<p>Display now showing page " + String(testPage) + ".</p>"
+      "<a href='/'>Back</a></body></html>");
+  });
+
+  // Exit test mode
+  server.on("/testoff", HTTP_POST, [](AsyncWebServerRequest* request) {
+    testMode = false;
+    testPage = 1;
+    updateDisplay();
+    request->send(200, "text/html",
+      "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
+      "<h2 style='color:#2a6'>Test Mode Off</h2>"
+      "<p>Display returning to page " + String(displayPage) + ".</p>"
       "<a href='/'>Back</a></body></html>");
   });
 
@@ -446,6 +557,7 @@ void initWifi() {
 
 void stopWifi() {
   server.end();
+  MDNS.end();
   WiFi.softAPdisconnect(true);
   wifiActive = false;
   Serial.println("WiFi AP stopped");
@@ -456,7 +568,8 @@ void stopWifi() {
 // DISPLAY
 // ============================================================
 void updateDisplay() {
-  switch (displayPage) {
+  int page = testMode ? testPage : displayPage;
+  switch (page) {
     case 1: drawPage1(); break;
     case 2: drawPage2(); break;
     case 3: drawPage3(); break;
@@ -466,20 +579,56 @@ void updateDisplay() {
 }
 
 void drawPage1() {
-  // Range + SOC% + kWh  (matches Paul's original Page 1 layout)
+  // Range + SOC% + kWh
+  // Based on Paul Kennett's original layout with these changes:
+  //   - battery_small (outline) instead of battery_solid
+  //   - "km" drawn vertically beside range number to save horizontal space
+  //   - LINE3 raised to avoid defective bottom pixel rows
   char buf[8];
   u8g2.clearBuffer();
-  u8g2.drawXBM(0, 40, 56, 24, battery_solid_bits);
+
+  // Battery outline graphic - bottom left
+  u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
+
+  // Large range number - shifted right slightly to make room for vertical km
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(39, 32);
-  dtostrf(range, 3, 0, buf); u8g2.print(buf);
+  u8g2.setCursor(45, 38);
+  if (rawGids != 0) {
+    dtostrf(range, 3, 0, buf);
+    u8g2.print(buf);
+  } else {
+    u8g2.print(" --");
+  }
+
+  // "Range" label - medium font top left
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 24);  u8g2.print("Range");
-  u8g2.setCursor(103, 24); u8g2.print("km");
-  u8g2.setCursor(5, 64);
-  dtostrf(GidsPct, 3, 0, buf); u8g2.print(buf); u8g2.print("%");
-  u8g2.setCursor(kWh >= 10 ? 62 : 72, 64);
-  dtostrf(kWh, 3, 1, buf); u8g2.print(buf); u8g2.print("kWh");
+  u8g2.setCursor(0, LINE1);
+  u8g2.print("Range");
+
+  // "km" stacked vertically - medium font, right of range number
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(118, 20);
+  u8g2.print("k");
+  u8g2.setCursor(118, 32);
+  u8g2.print("m");
+
+  // SOC% - medium font, bottom centre
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  u8g2.setCursor(58, LINE3);
+  if (rawGids != 0) {
+    dtostrf(GidsPct, 3, 0, buf);
+    u8g2.print(buf);
+  } else {
+    u8g2.print(" --");
+  }
+  u8g2.print("%");
+
+  // kWh - medium font, bottom right
+  u8g2.setCursor(kWh >= 10 ? 58 : 68, LINE4);
+  dtostrf(kWh, 3, 1, buf);
+  u8g2.print(buf);
+  u8g2.print("kWh");
+
   u8g2.sendBuffer();
 }
 
@@ -490,33 +639,47 @@ void drawPage2() {
   u8g2.drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
   u8g2.setFont(u8g2_font_logisoso26_tn);
   u8g2.setCursor(41, 33);
-  dtostrf(GidsPct, 3, 0, buf); u8g2.print(buf);
+  if (rawGids != 0) {
+    dtostrf(GidsPct, 3, 0, buf); u8g2.print(buf);
+  } else {
+    u8g2.print(" --");
+  }
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(36, 64);
-  dtostrf(kWh, 3, 1, buf); u8g2.print(buf); u8g2.print(" kWh");
+  u8g2.setCursor(30, LINE3);  // raised from 64 to LINE3=54
+  if (rawGids != 0) {
+    dtostrf(kWh, 3, 1, buf); u8g2.print(buf); u8g2.print(" kWh");
+  } else {
+    u8g2.print("-- kWh");
+  }
   u8g2.sendBuffer();
 }
 
 void drawPage3() {
-  // Range only - large
+  // Range only - large centred display
   char buf[8];
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(39, 47);
-  dtostrf(range, 3, 0, buf); u8g2.print(buf);
+  u8g2.setCursor(39, 44);
+  if (rawGids != 0) {
+    dtostrf(range, 3, 0, buf); u8g2.print(buf);
+  } else {
+    u8g2.print(" --");
+  }
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 39);  u8g2.print("Range");
-  u8g2.setCursor(103, 39); u8g2.print("km");
+  u8g2.setCursor(0, LINE2);    u8g2.print("Range");
+  u8g2.setCursor(103, LINE2);  u8g2.print("km");
   u8g2.sendBuffer();
 }
 
 void drawPage4() {
-  // Version info
+  // Version info - small font, 12px spacing fits 5 lines in 64px
   u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 16); u8g2.print(VERSION);
-  u8g2.setCursor(0, 38); u8g2.print(DATE);
-  u8g2.setCursor(0, 60); u8g2.print(AUTHOR);
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(0, 10);  u8g2.print(VERSION);
+  u8g2.setCursor(0, 22);  u8g2.print("Paul Kennett (original)");
+  u8g2.setCursor(0, 34);  u8g2.print(DATE);
+  u8g2.setCursor(0, 46);  u8g2.print(AUTHOR);
+  u8g2.setCursor(0, 58);  u8g2.print("github.com/Mozzie-AU");
   u8g2.sendBuffer();
 }
 
