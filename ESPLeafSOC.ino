@@ -14,8 +14,8 @@
 //   - Settings (page, km/kWh, pack type) via WiFi web portal replaces HVAC button UI
 //   - Settings stored in ESP32 NVS (Preferences) replaces Arduino EEPROM
 //   - uint16_t maxGids replaces byte - supports 30/40/62kWh packs
-//   - Auto-learn maxGids retained and extended for pack ageing compensation
-//   - Pack type preset seeds maxGids on first boot for immediate accuracy
+//   - maxGids currently fixed at pack type preset (auto-learn deferred to T-2CAN/SoH work)
+//   - Pack type preset sets maxGids directly via web portal selection
 //   - WS2812 RGB LED provides power/CAN receive diagnostics
 //   - Only CAN messages 0x5BC (GIDS) and 0x55B (SOC%) are processed
 //
@@ -69,12 +69,27 @@
 //         testMode loop update rate limited to 100ms to avoid hammering display.
 //   v09 - Page 2: % symbol switched to 6x10 small font, repositioned to x=90,y=28
 //         to sit cleanly inside battery outline without overlap or glyph artifacts.
+//         (Ray's manual refinements: page 1 SOC% repositioned to x=5,y=62 inside
+//         battery outline footprint; page 2 duplicate % print calls commented out.)
+//   v10 - Removed auto-learn maxGids stub - simplified to pack type default only
+//         until T-2CAN dual-bus SoH (0x5B3) integration is implemented.
+//         maxGids now fixed at pack type preset, adjustable only via web portal
+//         pack type selection. WH_PER_GID clarified as usable-energy figure (75),
+//         not stored-capacity figure (80) - see comment at definition.
+//         Future: T-2CAN board (ESP32-S3, dual CAN) will read 0x5B3 SoH from
+//         Car-CAN and compute maxGids = packTypeFullGids * (SoH/100), allowing
+//         the displayed SOC% to track real battery health as the pack ages.
+//   v11 - MaxGIDS field on web portal changed from read-only to editable.
+//         Manual override applied when pack type is unchanged on save.
+//         Selecting a different pack type still resets MaxGIDS to that preset,
+//         overriding any manually entered value from before the change.
 
 // ============================================================
 // TODO:
 //   1. Verify GIDS decode bit-shift for 0x5BC matches your Leaf model year
-//   2. Implement auto-learn MaxGids update logic in processCanMessage()
-//   3. Research and verify exact MaxGids values for 30/40/62kWh packs
+//   2. Implement T-2CAN dual-bus SoH (0x5B3) integration once board arrives -
+//      maxGids = packTypeFullGids * (SoH/100), replacing fixed preset
+//   3. Verify WH_PER_GID (75 vs 80) against live data once CAN testing begins
 // ============================================================
 
 #include <Arduino.h>
@@ -93,7 +108,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v09"
+#define VERSION   "ESPLeafSOC v11"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -124,11 +139,16 @@
 // CAN / Leaf constants
 // ------------------------------------------------------------
 #define GIDS_TURTLE     8         // GIDS at which Leaf enters turtle mode
-#define WH_PER_GID      75.0F    // Wh per GID (from Leaf hacking community)
+// Wh per GID - community-estimated, not an official Nissan figure.
+// Two values commonly quoted, measuring different things:
+//   ~80 Wh/GID = stored/charged energy (matches LeafSpy "Wh", OVMS default)
+//   ~75 Wh/GID = usable/discharge energy (round-trip losses + reserve)
+// We use 75 here since kWh/range are meant to reflect real-world usable range,
+// not nameplate stored capacity. Revisit if test data suggests otherwise.
+#define WH_PER_GID      75.0F
 
-// Battery pack type presets - seeds maxGids on first boot
+// Battery pack type presets - sets maxGids directly (no auto-learn currently)
 // Values are approximate full-charge GIDS for a new pack.
-// Auto-learn will reduce these as the pack ages.
 // Source: Leaf community (mnl.li/wiki, MyNissanLeaf forums) - verify/refine
 #define PACK_24KWH_GIDS   281
 #define PACK_30KWH_GIDS   340
@@ -158,10 +178,6 @@
 // Hardware SPI - CLK=33, MOSI=32, CS=25, DC=18, RST=35
 // U8G2_R0 = no rotation, U8G2_R2 = 180 degrees (match your physical mount)
 //
-// Uncomment the line matching your display's driver chip.
-// Existing Keyestudio installs: SH1106 (default)
-// Seeedstudio and some others:  SSD1306
-
 // Display rotation is now set at runtime from NVS via u8g2.setDisplayRotation()
 // Constructor always uses U8G2_R0 - rotation applied in setup() after loadSettings()
 //
@@ -349,7 +365,7 @@ void loadSettings() {
   packType = prefs.getInt(NVS_PACK_TYPE, 1);
   if (packType < 1 || packType > 4) packType = 1;
 
-  // Determine seed maxGids from pack type if not yet learned
+  // Determine seed maxGids from pack type
   uint16_t seedGids;
   switch (packType) {
     case 2:  seedGids = PACK_30KWH_GIDS; break;
@@ -358,7 +374,7 @@ void loadSettings() {
     default: seedGids = PACK_24KWH_GIDS; break;
   }
 
-  // Load learned maxGids - if not set yet, use seed value
+  // Load maxGids (preset or manually overridden value saved previously)
   maxGids = prefs.getUShort(NVS_MAX_GIDS, seedGids);
 
   // Safety check - if stored value is wildly out of range, reset to seed
@@ -416,13 +432,14 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     // GIDS - raw battery capacity (500ms interval)
     rawGids = (data[0] << 2) | (data[1] >> 6);
 
-    // Auto-learn maxGids: only update downward from seed (tracks pack ageing)
-    // Only update if rawGids is a plausible full-charge reading (above 95% of current max)
-    if (rawGids > 0 && rawGids < maxGids && rawGids > (maxGids * 95 / 100)) {
-      // TODO: add boot-startup logic here - only update maxGids from first
-      // reading after power-on (like Paul's InitialGids approach) to avoid
-      // mid-drive partial readings corrupting the learned value
-    }
+    // maxGids is currently fixed at the pack type preset (or manual override
+    // entered via the web portal). No auto-learn or auto-adjust is applied
+    // here - this is intentional for now.
+    // Future: when the T-2CAN dual-CAN board is in place, maxGids will instead
+    // be computed from the BMS-reported State of Health (CAN ID 0x5B3, Car-CAN
+    // bus) as maxGids = packTypeFullGids * (SoH / 100.0), giving an accurate,
+    // continuously-updated reading of the pack's real current capacity rather
+    // than guessing from observed GIDS readings alone.
 
     // Recalculate derived values
     GidsPct = ((float)(rawGids - GIDS_TURTLE) / (float)(maxGids - GIDS_TURTLE)) * 100.0F;
@@ -490,7 +507,13 @@ void initWifi() {
       "<option value='3'" + String(packType==3?" selected":"") + ">40 kWh (Gen 3 - 2018+)</option>"
       "<option value='4'" + String(packType==4?" selected":"") + ">62 kWh (Gen 3 e+)</option>"
       "</select>"
-      "<div class='info'>Sets initial MaxGIDS. Auto-learn will refine this over time.</div>"
+      "<div class='info'>Sets MaxGIDS used for SOC% calculation.</div>"
+
+      "<label>MaxGIDS (override)</label>"
+      "<input type='number' name='maxgids' min='50' max='600' step='1' value='"
+      + String(maxGids) + "'>"
+      "<div class='info'>Set by pack type above, or edit directly. "
+      "Changing pack type resets this to that pack's default.</div>"
 
       "<label>Display Rotation</label>"
       "<select name='rotation'>"
@@ -498,9 +521,6 @@ void initWifi() {
       "<option value='0'" + String(displayRotation==0?" selected":"") + ">0° (normal)</option>"
       "</select>"
       "<div class='info'>Match your physical display mount orientation.</div>"
-
-      "<div class='info' style='margin-top:16px'>Current learned MaxGIDS: <b>"
-      + String(maxGids) + "</b></div>"
 
       "<input type='submit' value='Save Settings'>"
       "</form>"
@@ -530,13 +550,19 @@ void initWifi() {
     if (request->hasParam("packtype", true)) {
       int newPackType = request->getParam("packtype", true)->value().toInt();
       if (newPackType != packType) {
-        // Pack type changed - reseed maxGids from preset
+        // Pack type changed - reseed maxGids from preset, ignore manual field this time
         packType = newPackType;
         switch (packType) {
           case 2: maxGids = PACK_30KWH_GIDS; break;
           case 3: maxGids = PACK_40KWH_GIDS; break;
           case 4: maxGids = PACK_62KWH_GIDS; break;
           default: maxGids = PACK_24KWH_GIDS; break;
+        }
+      } else if (request->hasParam("maxgids", true)) {
+        // Pack type unchanged - apply manual MaxGIDS override if provided
+        uint16_t manualGids = request->getParam("maxgids", true)->value().toInt();
+        if (manualGids >= 50 && manualGids <= 600) {
+          maxGids = manualGids;
         }
       }
     }
@@ -606,61 +632,56 @@ void updateDisplay() {
 }
 
 void drawPage1() {
-  // Layout (128x64 display, avoid bottom 6px):
-  //   Row 0-16:  "Range" label (logisoso16, baseline y=16)
-  //   Row 0-38:  Large range number (logisoso32, baseline y=38)
-  //   Row 0-32:  Vertical "km" small font (y=22, y=32)
-  //   Row 40-63: battery_small graphic (56x24px, top-left)
-  //   Row 46-58: SOC% right of battery (logisoso16, baseline y=58)
-  //   Row 46-58: kWh right of battery (logisoso16, baseline y=58) -- too wide, use small font
+  // Layout (128x64 display, full height used):
+  //   "Range" label top left, large range number, vertical "km" right edge,
+  //   battery_small outline bottom left, SOC% inside battery footprint (x=5),
+  //   kWh alongside at x=62, both on bottom line y=62.
   char buf[8];
   u8g2.clearBuffer();
 
   // "Range" label top left - medium font
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 16);
+  u8g2.setCursor(0, 34);
   u8g2.print("Range");
 
   // Large range number - centre top area
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(38, 38);
+  u8g2.setCursor(50, 38);
   if (rawGids != 0) {
     dtostrf(range, 3, 0, buf);
     u8g2.print(buf);
   } else {
-    u8g2.print(" --");
+    u8g2.print("---");
   }
 
   // "km" stacked vertically right edge
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(120, 20);
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  u8g2.setCursor(111, 20);
   u8g2.print("k");
-  u8g2.setCursor(120, 32);
+  u8g2.setCursor(111, 36);
   u8g2.print("m");
 
   // Battery outline graphic bottom left (56x24 starting at y=40)
   u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
 
-  // SOC% and kWh side by side on bottom line
-  // Bottom right quadrant: x=58-128, y=40-64
-  // logisoso16 for SOC%, small font for kWh to fit on one line at y=62
+  // SOC% and kWh side by side on bottom line, SOC% inside battery outline footprint
   u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(58, 62);
+  u8g2.setCursor(5, 62);
   if (rawGids != 0) {
     dtostrf(GidsPct, 3, 0, buf);
     u8g2.print(buf);
     u8g2.print("%");
   } else {
-    u8g2.print("--%");
+    u8g2.print("---%");
   }
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(96, 62);
+  u8g2.setFont(u8g2_font_logisoso16_tr);
+  u8g2.setCursor(62, 62);
   if (rawGids != 0) {
     dtostrf(kWh, 4, 1, buf);
     u8g2.print(buf);
-    u8g2.print("k");
+    u8g2.print("kWh");
   } else {
-    u8g2.print("-.--k");
+    u8g2.print("--.-kWh");
   }
 
   u8g2.sendBuffer();
@@ -668,15 +689,16 @@ void drawPage1() {
 
 void drawPage2() {
   // battery_large is 128x41px - draws from y=0 to y=40
-  // SOC% number centred inside battery outline
-  // kWh below battery graphic, clear of bottom defects
+  // SOC% number centred inside battery outline (% intentionally suppressed -
+  // see commented print calls below, Ray's choice to avoid clutter/overlap)
+  // kWh below battery graphic at y=62, full 64px available
   char buf[8];
   u8g2.clearBuffer();
 
   // Battery large outline graphic - full width, top of screen
   u8g2.drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
 
-  // SOC% inside battery - logisoso26 numerals, % in smaller font
+  // SOC% inside battery - logisoso26 numerals
   // Battery interior roughly x=10 to x=118, y=4 to y=37
   u8g2.setFont(u8g2_font_logisoso26_tn);
   u8g2.setCursor(28, 32);
@@ -685,15 +707,15 @@ void drawPage2() {
     u8g2.print(buf);
     u8g2.setFont(u8g2_font_6x10_tr);
     u8g2.setCursor(90, 28);
-    u8g2.print("%");
+    //u8g2.print("%");
   } else {
-    u8g2.print(" --");
+    u8g2.print("---");
     u8g2.setFont(u8g2_font_6x10_tr);
     u8g2.setCursor(90, 28);
-    u8g2.print("%");
+    //u8g2.print("%");
   }
 
-  // kWh below battery - medium font, y=62 now full 64px available
+  // kWh below battery - medium font, y=62 full 64px available
   u8g2.setFont(u8g2_font_logisoso16_tr);
   u8g2.setCursor(20, 62);
   if (rawGids != 0) {
@@ -721,12 +743,12 @@ void drawPage3() {
 
   // Large range number - full 64px available, baseline y=62
   u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(22, 62);
+  u8g2.setCursor(44, 62);
   if (rawGids != 0) {
     dtostrf(range, 3, 0, buf);
     u8g2.print(buf);
   } else {
-    u8g2.print(" --");
+    u8g2.print("---");
   }
   u8g2.sendBuffer();
 }
