@@ -83,6 +83,10 @@
 //         Manual override applied when pack type is unchanged on save.
 //         Selecting a different pack type still resets MaxGIDS to that preset,
 //         overriding any manually entered value from before the change.
+//   v12 - Added page 5: Diagnostics. Shows rawGids, maxGids, rawSoc/SocPct,
+//         GidsPct, kWh, range, time since last CAN message, and pack type -
+//         all on the OLED for bench testing without needing Serial Monitor.
+//         Test mode and display page selector both extended to cover 5 pages.
 
 // ============================================================
 // TODO:
@@ -108,7 +112,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v11"
+#define VERSION   "ESPLeafSOC v12"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -262,6 +266,7 @@ void drawPage1();
 void drawPage2();
 void drawPage3();
 void drawPage4();
+void drawPage5();
 
 // ============================================================
 // SETUP
@@ -357,7 +362,7 @@ void loadSettings() {
   prefs.begin(NVS_NAMESPACE, false);
 
   displayPage = prefs.getInt(NVS_PAGE, 1);
-  if (displayPage < 1 || displayPage > 4) displayPage = 1;
+  if (displayPage < 1 || displayPage > 5) displayPage = 1;
 
   kmPerKwh = prefs.getFloat(NVS_KM_PER_KWH, 6.4F);
   if (kmPerKwh < 1.0F || kmPerKwh > 20.0F) kmPerKwh = 6.4F;
@@ -493,6 +498,7 @@ void initWifi() {
       "<option value='2'" + String(displayPage==2?" selected":"") + ">2 - Large SOC% + kWh</option>"
       "<option value='3'" + String(displayPage==3?" selected":"") + ">3 - Range only</option>"
       "<option value='4'" + String(displayPage==4?" selected":"") + ">4 - Version info</option>"
+      "<option value='5'" + String(displayPage==5?" selected":"") + ">5 - Diagnostics</option>"
       "</select>"
 
       "<label>km per kWh</label>"
@@ -582,7 +588,7 @@ void initWifi() {
   // Test mode - advance to next page
   server.on("/test", HTTP_POST, [](AsyncWebServerRequest* request) {
     testMode = true;
-    testPage = (testPage % 4) + 1;  // cycle 1->2->3->4->1
+    testPage = (testPage % 5) + 1;  // cycle 1->2->3->4->5->1
     displayNeedsUpdate = true;       // main loop handles actual display update
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
@@ -627,6 +633,7 @@ void updateDisplay() {
     case 2: drawPage2(); break;
     case 3: drawPage3(); break;
     case 4: drawPage4(); break;
+    case 5: drawPage5(); break;
     default: drawPage1(); break;
   }
 }
@@ -762,6 +769,42 @@ void drawPage4() {
   u8g2.setCursor(0, 34);  u8g2.print(DATE);
   u8g2.setCursor(0, 46);  u8g2.print(AUTHOR);
   u8g2.setCursor(0, 58);  u8g2.print("github.com/Mozzie-AU");
+  u8g2.sendBuffer();
+}
+
+void drawPage5() {
+  // Diagnostics page - raw values for bench testing and calibration.
+  // Small font, 6 lines at 10px spacing fits comfortably in 64px.
+  // Useful for checking rawGids vs maxGids without a laptop/Serial Monitor.
+  char buf[16];
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tr);
+
+  u8g2.setCursor(0, 9);
+  snprintf(buf, sizeof(buf), "rawGids: %u", rawGids);
+  u8g2.print(buf);
+
+  u8g2.setCursor(0, 19);
+  snprintf(buf, sizeof(buf), "maxGids: %u", maxGids);
+  u8g2.print(buf);
+
+  u8g2.setCursor(0, 29);
+  snprintf(buf, sizeof(buf), "rawSoc: %u (%.1f%%)", rawSoc, SocPct);
+  u8g2.print(buf);
+
+  u8g2.setCursor(0, 39);
+  snprintf(buf, sizeof(buf), "GidsPct: %.1f%%", GidsPct);
+  u8g2.print(buf);
+
+  u8g2.setCursor(0, 49);
+  snprintf(buf, sizeof(buf), "kWh: %.2f  rng: %d", kWh, range);
+  u8g2.print(buf);
+
+  u8g2.setCursor(0, 59);
+  unsigned long secsSinceRx = lastCanRxTime > 0 ? (millis() - lastCanRxTime) / 1000 : 0;
+  snprintf(buf, sizeof(buf), "CAN age: %lus  pack:%d", secsSinceRx, packType);
+  u8g2.print(buf);
+
   u8g2.sendBuffer();
 }
 
