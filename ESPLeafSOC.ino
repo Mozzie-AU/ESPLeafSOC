@@ -13,9 +13,8 @@
 //   - OLED retains SPI interface (hardware jumpered on existing installs)
 //   - Settings (page, km/kWh, pack type) via WiFi web portal replaces HVAC button UI
 //   - Settings stored in ESP32 NVS (Preferences) replaces Arduino EEPROM
-//   - uint16_t maxGids replaces byte - supports 30/40/62kWh packs
-//   - maxGids currently fixed at pack type preset (auto-learn deferred to T-2CAN/SoH work)
-//   - Pack type preset sets maxGids directly via web portal selection
+//   - SOC% is read directly from the BMS (CAN 0x55B) - no pack type/maxGids needed
+//   - kWh and range remain GIDS-based (CAN 0x5BC) for finer resolution
 //   - WS2812 RGB LED provides power/CAN receive diagnostics
 //   - Only CAN messages 0x5BC (GIDS) and 0x55B (SOC%) are processed
 //
@@ -87,6 +86,23 @@
 //         GidsPct, kWh, range, time since last CAN message, and pack type -
 //         all on the OLED for bench testing without needing Serial Monitor.
 //         Test mode and display page selector both extended to cover 5 pages.
+//   v13 - Switched primary displayed SOC% (pages 1 and 2) from GidsPct to SocPct.
+//         Live testing showed GidsPct stuck at 100% while car's own BMS reported
+//         91.2% via 0x55B (rawSoc) - GIDS-based % cannot self-correct for actual
+//         pack SoH (measured 81.2% via LeafSpy) without reading 0x5B3 (T-2CAN
+//         project). The BMS already solves this problem, so we now trust it
+//         directly for the displayed percentage. kWh and range remain GIDS-based
+//         since GIDS still gives finer resolution for those. GidsPct retained
+//         and still shown on diagnostics page 5 for comparison.
+//         maxGids/pack type selection in web portal is now informational only
+//         for kWh/range, no longer drives the primary SOC% figure - portal
+//         simplification deferred to a later version.
+//   v14 - Removed maxGids, packType, and GidsPct entirely. BMS-reported SOC%
+//         (CAN 0x55B) is now the only displayed percentage, with no pack type
+//         selection, presets, or manual MaxGIDS override needed. kWh and range
+//         remain GIDS-based (CAN 0x5BC). Web portal simplified to: display page,
+//         km/kWh, display rotation. NVS keys for pack type/maxGids no longer
+//         written; any previously stored values are simply ignored.
 
 // ============================================================
 // TODO:
@@ -112,7 +128,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v12"
+#define VERSION   "ESPLeafSOC v14"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -151,13 +167,9 @@
 // not nameplate stored capacity. Revisit if test data suggests otherwise.
 #define WH_PER_GID      75.0F
 
-// Battery pack type presets - sets maxGids directly (no auto-learn currently)
-// Values are approximate full-charge GIDS for a new pack.
-// Source: Leaf community (mnl.li/wiki, MyNissanLeaf forums) - verify/refine
-#define PACK_24KWH_GIDS   281
-#define PACK_30KWH_GIDS   340
-#define PACK_40KWH_GIDS   395
-#define PACK_62KWH_GIDS   536
+// GIDS_TURTLE kept for potential future use in kWh/range calculations.
+// Pack type presets and maxGids removed in v14 - SOC% now comes directly
+// from the BMS (CAN 0x55B), making pack-size-based capacity guessing redundant.
 
 // ------------------------------------------------------------
 // WiFi AP settings
@@ -172,8 +184,6 @@
 #define NVS_NAMESPACE   "leafsoc"
 #define NVS_PAGE        "page"
 #define NVS_KM_PER_KWH  "kmkwh"
-#define NVS_PACK_TYPE   "packtype"
-#define NVS_MAX_GIDS    "maxgids"
 #define NVS_ROTATION    "rotation"
 
 // ------------------------------------------------------------
@@ -218,7 +228,7 @@ unsigned long ledLastUpdate = 0;
 uint16_t rawGids     = 0;
 uint16_t rawGids2    = 0;    // previous value - detect changes
 uint16_t rawSoc      = 0;
-float    GidsPct     = 0.0F; // SOC% derived from GIDS (primary display value)
+// GidsPct removed in v14 - SOC% now comes directly from BMS (rawSoc/SocPct below)
 float    SocPct      = 0.0F; // SOC% direct from BMS (cross-check)
 float    kWh         = 0.0F; // energy remaining
 int      range       = 0;    // estimated range km
@@ -233,8 +243,7 @@ Preferences prefs;
 
 int      displayPage    = 1;
 float    kmPerKwh       = 6.4F;
-int      packType       = 1;       // 1=24kWh, 2=30kWh, 3=40kWh, 4=62kWh
-uint16_t maxGids        = PACK_24KWH_GIDS;  // overwritten from NVS on boot
+// packType and maxGids removed in v14 - no longer needed for SOC% calculation
 int      displayRotation = 2;     // 0 = normal, 2 = 180 degrees (U8G2_R0 / U8G2_R2)
 
 // Test mode - cycles display pages for layout checking (not saved to NVS)
@@ -367,40 +376,20 @@ void loadSettings() {
   kmPerKwh = prefs.getFloat(NVS_KM_PER_KWH, 6.4F);
   if (kmPerKwh < 1.0F || kmPerKwh > 20.0F) kmPerKwh = 6.4F;
 
-  packType = prefs.getInt(NVS_PACK_TYPE, 1);
-  if (packType < 1 || packType > 4) packType = 1;
-
-  // Determine seed maxGids from pack type
-  uint16_t seedGids;
-  switch (packType) {
-    case 2:  seedGids = PACK_30KWH_GIDS; break;
-    case 3:  seedGids = PACK_40KWH_GIDS; break;
-    case 4:  seedGids = PACK_62KWH_GIDS; break;
-    default: seedGids = PACK_24KWH_GIDS; break;
-  }
-
-  // Load maxGids (preset or manually overridden value saved previously)
-  maxGids = prefs.getUShort(NVS_MAX_GIDS, seedGids);
-
-  // Safety check - if stored value is wildly out of range, reset to seed
-  if (maxGids < 100 || maxGids > 600) maxGids = seedGids;
-
   // Load display rotation (0=normal, 2=180 degrees) - default 2 for existing installs
   displayRotation = prefs.getInt(NVS_ROTATION, 2);
   if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
 
   prefs.end();
 
-  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f packType=%d maxGids=%d rotation=%d\n",
-                displayPage, kmPerKwh, packType, maxGids, displayRotation);
+  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f rotation=%d\n",
+                displayPage, kmPerKwh, displayRotation);
 }
 
 void saveSettings() {
   prefs.begin(NVS_NAMESPACE, false);
   prefs.putInt(NVS_PAGE, displayPage);
   prefs.putFloat(NVS_KM_PER_KWH, kmPerKwh);
-  prefs.putInt(NVS_PACK_TYPE, packType);
-  prefs.putUShort(NVS_MAX_GIDS, maxGids);
   prefs.putInt(NVS_ROTATION, displayRotation);
   prefs.end();
   // Apply new rotation immediately without reboot
@@ -437,26 +426,20 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     // GIDS - raw battery capacity (500ms interval)
     rawGids = (data[0] << 2) | (data[1] >> 6);
 
-    // maxGids is currently fixed at the pack type preset (or manual override
-    // entered via the web portal). No auto-learn or auto-adjust is applied
-    // here - this is intentional for now.
-    // Future: when the T-2CAN dual-CAN board is in place, maxGids will instead
-    // be computed from the BMS-reported State of Health (CAN ID 0x5B3, Car-CAN
-    // bus) as maxGids = packTypeFullGids * (SoH / 100.0), giving an accurate,
-    // continuously-updated reading of the pack's real current capacity rather
-    // than guessing from observed GIDS readings alone.
-
-    // Recalculate derived values
-    GidsPct = ((float)(rawGids - GIDS_TURTLE) / (float)(maxGids - GIDS_TURTLE)) * 100.0F;
-    GidsPct = constrain(GidsPct, 0.0F, 100.0F);
-    kWh     = ((float)rawGids * WH_PER_GID) / 1000.0F;
-    range   = (int)(kmPerKwh * ((rawGids - GIDS_TURTLE) * WH_PER_GID) / 1000.0F);
+    // SOC% no longer calculated from GIDS (see SocPct from 0x55B below) -
+    // GIDS is retained purely for kWh and range, which benefit from its
+    // finer resolution compared to the BMS's 0.1% SOC steps.
+    kWh   = ((float)rawGids * WH_PER_GID) / 1000.0F;
+    range = (int)(kmPerKwh * ((rawGids - GIDS_TURTLE) * WH_PER_GID) / 1000.0F);
 
     lastCanRxTime = millis();
     ledState = LED_CAN_OK;
 
   } else if (id == 0x55B) {
-    // SOC% direct from BMS (100ms interval) - cross-check only
+    // SOC% direct from BMS (100ms interval) - primary displayed value.
+    // The BMS already accounts for actual pack State of Health, which a
+    // GIDS-based calculation cannot do without a separate SoH reading
+    // (CAN 0x5B3, Car-CAN bus - see T-2CAN project notes).
     rawSoc  = (data[0] << 2) | (data[1] >> 6);
     SocPct  = rawSoc / 10.0F;
   }
@@ -506,21 +489,6 @@ void initWifi() {
       + String(kmPerKwh, 1) + "'>"
       "<div class='info'>Your average efficiency. Used to calculate range estimate.</div>"
 
-      "<label>Battery Pack Type</label>"
-      "<select name='packtype'>"
-      "<option value='1'" + String(packType==1?" selected":"") + ">24 kWh (Gen 1 - 2011-2012)</option>"
-      "<option value='2'" + String(packType==2?" selected":"") + ">30 kWh (Gen 2 - 2016)</option>"
-      "<option value='3'" + String(packType==3?" selected":"") + ">40 kWh (Gen 3 - 2018+)</option>"
-      "<option value='4'" + String(packType==4?" selected":"") + ">62 kWh (Gen 3 e+)</option>"
-      "</select>"
-      "<div class='info'>Sets MaxGIDS used for SOC% calculation.</div>"
-
-      "<label>MaxGIDS (override)</label>"
-      "<input type='number' name='maxgids' min='50' max='600' step='1' value='"
-      + String(maxGids) + "'>"
-      "<div class='info'>Set by pack type above, or edit directly. "
-      "Changing pack type resets this to that pack's default.</div>"
-
       "<label>Display Rotation</label>"
       "<select name='rotation'>"
       "<option value='2'" + String(displayRotation==2?" selected":"") + ">180° (default - existing installs)</option>"
@@ -553,25 +521,6 @@ void initWifi() {
       displayPage = request->getParam("page", true)->value().toInt();
     if (request->hasParam("kmkwh", true))
       kmPerKwh = request->getParam("kmkwh", true)->value().toFloat();
-    if (request->hasParam("packtype", true)) {
-      int newPackType = request->getParam("packtype", true)->value().toInt();
-      if (newPackType != packType) {
-        // Pack type changed - reseed maxGids from preset, ignore manual field this time
-        packType = newPackType;
-        switch (packType) {
-          case 2: maxGids = PACK_30KWH_GIDS; break;
-          case 3: maxGids = PACK_40KWH_GIDS; break;
-          case 4: maxGids = PACK_62KWH_GIDS; break;
-          default: maxGids = PACK_24KWH_GIDS; break;
-        }
-      } else if (request->hasParam("maxgids", true)) {
-        // Pack type unchanged - apply manual MaxGIDS override if provided
-        uint16_t manualGids = request->getParam("maxgids", true)->value().toInt();
-        if (manualGids >= 50 && manualGids <= 600) {
-          maxGids = manualGids;
-        }
-      }
-    }
     if (request->hasParam("rotation", true)) {
       displayRotation = request->getParam("rotation", true)->value().toInt();
       if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
@@ -672,10 +621,13 @@ void drawPage1() {
   u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
 
   // SOC% and kWh side by side on bottom line, SOC% inside battery outline footprint
+  // SOC% now sourced directly from BMS (rawSoc/SocPct via CAN 0x55B) rather than
+  // calculated from GIDS - the BMS already accounts for actual pack SoH, whereas
+  // our GIDS-based calculation could not without knowing real current capacity.
   u8g2.setFont(u8g2_font_logisoso16_tr);
   u8g2.setCursor(5, 62);
-  if (rawGids != 0) {
-    dtostrf(GidsPct, 3, 0, buf);
+  if (rawSoc != 0) {
+    dtostrf(SocPct, 3, 0, buf);
     u8g2.print(buf);
     u8g2.print("%");
   } else {
@@ -706,11 +658,12 @@ void drawPage2() {
   u8g2.drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
 
   // SOC% inside battery - logisoso26 numerals
+  // Sourced directly from BMS (rawSoc/SocPct via CAN 0x55B) - see page 1 comment.
   // Battery interior roughly x=10 to x=118, y=4 to y=37
   u8g2.setFont(u8g2_font_logisoso26_tn);
   u8g2.setCursor(28, 32);
-  if (rawGids != 0) {
-    dtostrf(GidsPct, 3, 0, buf);
+  if (rawSoc != 0) {
+    dtostrf(SocPct, 3, 0, buf);
     u8g2.print(buf);
     u8g2.setFont(u8g2_font_6x10_tr);
     u8g2.setCursor(90, 28);
@@ -773,9 +726,8 @@ void drawPage4() {
 }
 
 void drawPage5() {
-  // Diagnostics page - raw values for bench testing and calibration.
-  // Small font, 6 lines at 10px spacing fits comfortably in 64px.
-  // Useful for checking rawGids vs maxGids without a laptop/Serial Monitor.
+  // Diagnostics page - raw values for bench testing.
+  // Small font, lines at 10px spacing fit comfortably in 64px.
   char buf[16];
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_6x10_tr);
@@ -785,24 +737,24 @@ void drawPage5() {
   u8g2.print(buf);
 
   u8g2.setCursor(0, 19);
-  snprintf(buf, sizeof(buf), "maxGids: %u", maxGids);
+  snprintf(buf, sizeof(buf), "rawSoc: %u", rawSoc);
   u8g2.print(buf);
 
   u8g2.setCursor(0, 29);
-  snprintf(buf, sizeof(buf), "rawSoc: %u (%.1f%%)", rawSoc, SocPct);
+  snprintf(buf, sizeof(buf), "SOC(BMS): %.1f%%", SocPct);
   u8g2.print(buf);
 
   u8g2.setCursor(0, 39);
-  snprintf(buf, sizeof(buf), "GidsPct: %.1f%%", GidsPct);
+  snprintf(buf, sizeof(buf), "kWh: %.2f", kWh);
   u8g2.print(buf);
 
   u8g2.setCursor(0, 49);
-  snprintf(buf, sizeof(buf), "kWh: %.2f  rng: %d", kWh, range);
+  snprintf(buf, sizeof(buf), "Range: %d km", range);
   u8g2.print(buf);
 
   u8g2.setCursor(0, 59);
   unsigned long secsSinceRx = lastCanRxTime > 0 ? (millis() - lastCanRxTime) / 1000 : 0;
-  snprintf(buf, sizeof(buf), "CAN age: %lus  pack:%d", secsSinceRx, packType);
+  snprintf(buf, sizeof(buf), "CAN age: %lus", secsSinceRx);
   u8g2.print(buf);
 
   u8g2.sendBuffer();
