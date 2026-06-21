@@ -142,6 +142,16 @@
 //         default draw colour. setDrawColor(0) added before the SOC% text so
 //         it renders as black ("cut out" of the white icon), with setDrawColor(1)
 //         restored immediately after for the rest of the page.
+//   v20 - Battery State of Health (SoH%) decoded! Confirmed via
+//         dalathegreat/leaf_can_bus_messages (EV-can_ZE0.dbc) that SoH
+//         (LB_Capacity_Deterioration_Rate) is broadcast in CAN 0x5BC - the
+//         SAME message already decoded for GIDS. No second CAN bus or
+//         T-2CAN board needed for this after all - it was sitting right there
+//         in a message received since session 1. DBC signal definition:
+//         33|7@1+ (1,0) [0|100] "%" -> Intel format, start bit 33 = byte 4 bit 1,
+//         7 bits, 0-100 direct: rawSoh = (data[4] >> 1) & 0x7F.
+//         Diags tab "Battery SOH" row now shows the real live value instead
+//         of the "--" placeholder.
 
 // ============================================================
 // TODO:
@@ -167,7 +177,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v19"
+#define VERSION   "ESPLeafSOC v20"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -270,6 +280,7 @@ unsigned long savedFlashStart = 0;   // when the LED_SAVED indication began
 uint16_t rawGids     = 0;
 uint16_t rawGids2    = 0;    // previous value - detect changes
 uint16_t rawSoc      = 0;
+uint8_t  rawSoh      = 0;    // Battery State of Health %, 0-100 direct from BMS (CAN 0x5BC)
 // GidsPct removed in v14 - SOC% now comes directly from BMS (rawSoc/SocPct below)
 float    SocPct      = 0.0F; // SOC% direct from BMS (cross-check)
 float    kWh         = 0.0F; // energy remaining
@@ -485,6 +496,12 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     kWh   = ((float)rawGids * WH_PER_GID) / 1000.0F;
     range = (int)(kmPerKwh * ((rawGids - GIDS_TURTLE) * WH_PER_GID) / 1000.0F);
 
+    // State of Health (SoH%) - same message as GIDS, no second CAN bus needed.
+    // DBC: SG_ LB_Capacity_Deterioration_Rate : 33|7@1+ (1,0) [0|100] "%"
+    // (dalathegreat/leaf_can_bus_messages, EV-can_ZE0.dbc, message 0x5BC/1468)
+    // Intel(@1) format, start bit 33 -> byte 4, bit 1; 7 bits, 0-100 direct.
+    rawSoh = (data[4] >> 1) & 0x7F;
+
     lastCanRxTime = millis();
     if (ledState != LED_SAVED) ledState = LED_CAN_STATUS;
 
@@ -644,7 +661,7 @@ void initWifi() {
     json += "\"rawGids\":" + String(rawGids) + ",";
     json += "\"rawSoc\":" + String(rawSoc) + ",";
     json += "\"socPct\":\"" + String(SocPct, 1) + "\",";
-    json += "\"soh\":\"--\","; // Not yet available - requires T-2CAN / CAN 0x5B3
+    json += "\"soh\":\"" + String(rawSoh) + "%\",";
     json += "\"kWh\":\"" + String(kWh, 2) + "\",";
     json += "\"range\":" + String(range) + ",";
     json += "\"canAge\":" + String(canAgeSecs) + ",";
