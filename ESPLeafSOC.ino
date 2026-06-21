@@ -121,6 +121,19 @@
 //         fades smoothly to black over 3 seconds, then returns automatically
 //         to whichever state is appropriate (CAN status, or boot pulse if
 //         still mid-setup with no CAN data yet seen).
+//   v17 - Web portal restructured into a tabbed layout: "Setup" (display page,
+//         km/kWh, rotation, OLED driver, save) and "Diags" (live rawGids,
+//         rawSoc, SOC%, kWh, range, CAN age, plus Test Mode buttons moved here
+//         from the Setup tab). Diags tab polls a new /diagsdata JSON endpoint
+//         every second via JavaScript so figures update live without manual
+//         page refresh - much friendlier on a phone browser.
+//         OLED page 5 (Diagnostics) removed entirely - this data now lives
+//         only in the web portal, freeing up a physical display page.
+//         display page count reverted to 4 (page selector, test mode cycle,
+//         loadSettings validation all updated accordingly).
+//         Diags tab includes a "Battery SOH" row, currently shows "--" since
+//         SOH (CAN 0x5B3, Car-CAN) isn't readable without the T-2CAN board -
+//         wired up ready to populate once that integration lands.
 
 // ============================================================
 // TODO:
@@ -146,7 +159,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v16"
+#define VERSION   "ESPLeafSOC v17"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -299,7 +312,6 @@ void drawPage1();
 void drawPage2();
 void drawPage3();
 void drawPage4();
-void drawPage5();
 
 // ============================================================
 // SETUP
@@ -398,7 +410,7 @@ void loadSettings() {
   prefs.begin(NVS_NAMESPACE, false);
 
   displayPage = prefs.getInt(NVS_PAGE, 1);
-  if (displayPage < 1 || displayPage > 5) displayPage = 1;
+  if (displayPage < 1 || displayPage > 4) displayPage = 1;
 
   kmPerKwh = prefs.getFloat(NVS_KM_PER_KWH, 6.4F);
   if (kmPerKwh < 1.0F || kmPerKwh > 20.0F) kmPerKwh = 6.4F;
@@ -497,18 +509,42 @@ void initWifi() {
     Serial.println("mDNS start failed - use 192.168.4.1");
   }
 
-  // Serve config page
+  // Serve config page - tabbed layout (Setup / Diags), mobile-friendly
   server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     String html = "<!DOCTYPE html><html><head>"
       "<meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<title>ESPLeafSOC Config</title>"
-      "<style>body{font-family:sans-serif;max-width:400px;margin:20px auto;padding:0 10px}"
-      "h2{color:#2a6;}label{display:block;margin-top:12px;font-weight:bold}"
-      "select,input{width:100%;padding:6px;margin-top:4px;font-size:1em}"
+      "<style>"
+      "body{font-family:sans-serif;max-width:400px;margin:20px auto;padding:0 10px}"
+      "h2{color:#2a6;margin-bottom:4px}"
+      "label{display:block;margin-top:12px;font-weight:bold}"
+      "select,input{width:100%;padding:6px;margin-top:4px;font-size:1em;box-sizing:border-box}"
       "input[type=submit]{background:#2a6;color:#fff;border:none;padding:12px;"
-      "margin-top:20px;cursor:pointer;border-radius:4px}"
-      ".info{color:#666;font-size:0.85em;margin-top:4px}</style></head><body>"
-      "<h2>ESPLeafSOC Settings</h2>"
+      "margin-top:20px;cursor:pointer;border-radius:4px;font-size:1em}"
+      ".info{color:#666;font-size:0.85em;margin-top:4px}"
+      ".tabs{display:flex;border-bottom:2px solid #ddd;margin-bottom:16px}"
+      ".tab{flex:1;text-align:center;padding:10px;cursor:pointer;"
+      "font-weight:bold;color:#888;background:none;border:none;font-size:1em}"
+      ".tab.active{color:#2a6;border-bottom:3px solid #2a6;margin-bottom:-2px}"
+      ".tabpage{display:none}"
+      ".tabpage.active{display:block}"
+      "table{width:100%;border-collapse:collapse;margin-top:8px}"
+      "td{padding:6px 4px;border-bottom:1px solid #eee}"
+      "td.val{text-align:right;font-weight:bold;font-family:monospace}"
+      ".testbtn{background:#a62;color:#fff;border:none;padding:10px 16px;"
+      "border-radius:4px;cursor:pointer;font-size:0.95em}"
+      ".offbtn{background:#666;color:#fff;border:none;padding:10px 16px;"
+      "border-radius:4px;cursor:pointer;font-size:0.95em;margin-left:8px}"
+      "</style></head><body>"
+
+      "<h2>ESPLeafSOC</h2>"
+      "<div class='tabs'>"
+      "<button class='tab active' id='tabbtn-setup' onclick=\"showTab('setup')\">Setup</button>"
+      "<button class='tab' id='tabbtn-diags' onclick=\"showTab('diags')\">Diags</button>"
+      "</div>"
+
+      // ---------------- SETUP TAB ----------------
+      "<div class='tabpage active' id='tab-setup'>"
       "<form action='/save' method='POST'>"
 
       "<label>Display Page</label>"
@@ -517,7 +553,6 @@ void initWifi() {
       "<option value='2'" + String(displayPage==2?" selected":"") + ">2 - Large SOC% + kWh</option>"
       "<option value='3'" + String(displayPage==3?" selected":"") + ">3 - Range only</option>"
       "<option value='4'" + String(displayPage==4?" selected":"") + ">4 - Version info</option>"
-      "<option value='5'" + String(displayPage==5?" selected":"") + ">5 - Diagnostics</option>"
       "</select>"
 
       "<label>km per kWh</label>"
@@ -542,22 +577,72 @@ void initWifi() {
 
       "<input type='submit' value='Save Settings'>"
       "</form>"
+      "</div>"
 
-      "<hr style='margin-top:24px'>"
-      "<h3>Display Test Mode</h3>"
-      "<p class='info'>Cycle through display pages to check layout. "
-      "Test mode is active while WiFi portal is open.</p>"
-      "<form action='/test' method='POST' style='display:inline'>"
-      "<button style='background:#a62;color:#fff;border:none;padding:10px 20px;"
-      "border-radius:4px;cursor:pointer;font-size:1em'>Next Page (now: "
-      + String(testMode ? testPage : displayPage) + ")</button>"
-      "</form>"
-      "<form action='/testoff' method='POST' style='display:inline;margin-left:10px'>"
-      "<button style='background:#666;color:#fff;border:none;padding:10px 20px;"
-      "border-radius:4px;cursor:pointer;font-size:1em'>Exit Test</button>"
-      "</form>"
+      // ---------------- DIAGS TAB ----------------
+      "<div class='tabpage' id='tab-diags'>"
+      "<table id='diagstable'>"
+      "<tr><td>rawGids</td><td class='val' id='d-rawgids'>-</td></tr>"
+      "<tr><td>rawSoc</td><td class='val' id='d-rawsoc'>-</td></tr>"
+      "<tr><td>SOC (BMS)</td><td class='val' id='d-socpct'>-</td></tr>"
+      "<tr><td>Battery SOH</td><td class='val' id='d-soh'>-</td></tr>"
+      "<tr><td>kWh</td><td class='val' id='d-kwh'>-</td></tr>"
+      "<tr><td>Range</td><td class='val' id='d-range'>-</td></tr>"
+      "<tr><td>CAN age</td><td class='val' id='d-canage'>-</td></tr>"
+      "</table>"
+
+      "<div style='margin-top:20px'>"
+      "<button class='testbtn' onclick=\"testNext()\">Next Page (<span id='d-testpage'>-</span>)</button>"
+      "<button class='offbtn' onclick=\"testOff()\">Exit Test</button>"
+      "</div>"
+      "<p class='info'>Cycles the OLED through its display pages for layout "
+      "checking. Test mode is active while this WiFi portal stays open.</p>"
+      "</div>"
+
+      "<script>"
+      "function showTab(name){"
+      "document.querySelectorAll('.tabpage').forEach(function(e){e.classList.remove('active')});"
+      "document.querySelectorAll('.tab').forEach(function(e){e.classList.remove('active')});"
+      "document.getElementById('tab-'+name).classList.add('active');"
+      "document.getElementById('tabbtn-'+name).classList.add('active');"
+      "if(name=='diags'){refreshDiags();}"
+      "}"
+      "function refreshDiags(){"
+      "fetch('/diagsdata').then(function(r){return r.json();}).then(function(d){"
+      "document.getElementById('d-rawgids').textContent=d.rawGids;"
+      "document.getElementById('d-rawsoc').textContent=d.rawSoc;"
+      "document.getElementById('d-socpct').textContent=d.socPct+'%';"
+      "document.getElementById('d-soh').textContent=d.soh;"
+      "document.getElementById('d-kwh').textContent=d.kWh+' kWh';"
+      "document.getElementById('d-range').textContent=d.range+' km';"
+      "document.getElementById('d-canage').textContent=d.canAge+'s';"
+      "document.getElementById('d-testpage').textContent=d.testPage;"
+      "});"
+      "}"
+      "function testNext(){fetch('/test',{method:'POST'}).then(refreshDiags);}"
+      "function testOff(){fetch('/testoff',{method:'POST'}).then(refreshDiags);}"
+      "setInterval(function(){"
+      "if(document.getElementById('tab-diags').classList.contains('active')){refreshDiags();}"
+      "},1000);"
+      "</script>"
       "</body></html>";
     request->send(200, "text/html", html);
+  });
+
+  // Live diagnostics data as JSON - polled by the Diags tab via JavaScript
+  server.on("/diagsdata", HTTP_GET, [](AsyncWebServerRequest* request) {
+    unsigned long canAgeSecs = lastCanRxTime > 0 ? (millis() - lastCanRxTime) / 1000 : 0;
+    String json = "{";
+    json += "\"rawGids\":" + String(rawGids) + ",";
+    json += "\"rawSoc\":" + String(rawSoc) + ",";
+    json += "\"socPct\":\"" + String(SocPct, 1) + "\",";
+    json += "\"soh\":\"--\","; // Not yet available - requires T-2CAN / CAN 0x5B3
+    json += "\"kWh\":\"" + String(kWh, 2) + "\",";
+    json += "\"range\":" + String(range) + ",";
+    json += "\"canAge\":" + String(canAgeSecs) + ",";
+    json += "\"testPage\":" + String(testMode ? testPage : displayPage);
+    json += "}";
+    request->send(200, "application/json", json);
   });
 
   server.on("/save", HTTP_POST, [](AsyncWebServerRequest* request) {
@@ -602,16 +687,13 @@ void initWifi() {
       "<a href='/'>Back</a></body></html>");
   });
 
-  // Test mode - advance to next page
+  // Test mode - advance to next page. Called via fetch() from the Diags tab;
+  // the response body isn't shown, refreshDiags() pulls fresh state right after.
   server.on("/test", HTTP_POST, [](AsyncWebServerRequest* request) {
     testMode = true;
-    testPage = (testPage % 5) + 1;  // cycle 1->2->3->4->5->1
+    testPage = (testPage % 4) + 1;  // cycle 1->2->3->4->1
     displayNeedsUpdate = true;       // main loop handles actual display update
-    request->send(200, "text/html",
-      "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
-      "<h2 style='color:#a62'>Test Mode - Page " + String(testPage) + "</h2>"
-      "<p>Display now showing page " + String(testPage) + ".</p>"
-      "<a href='/'>Back</a></body></html>");
+    request->send(200, "application/json", "{\"ok\":true}");
   });
 
   // Exit test mode
@@ -619,11 +701,7 @@ void initWifi() {
     testMode = false;
     testPage = 1;
     displayNeedsUpdate = true;       // main loop handles actual display update
-    request->send(200, "text/html",
-      "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
-      "<h2 style='color:#2a6'>Test Mode Off</h2>"
-      "<p>Display returning to page " + String(displayPage) + ".</p>"
-      "<a href='/'>Back</a></body></html>");
+    request->send(200, "application/json", "{\"ok\":true}");
   });
 
   server.begin();
@@ -657,7 +735,6 @@ void updateDisplay() {
     case 2: drawPage2(); break;
     case 3: drawPage3(); break;
     case 4: drawPage4(); break;
-    case 5: drawPage5(); break;
     default: drawPage1(); break;
   }
 }
@@ -800,40 +877,9 @@ void drawPage4() {
   u8g2->sendBuffer();
 }
 
-void drawPage5() {
-  // Diagnostics page - raw values for bench testing.
-  // Small font, lines at 10px spacing fit comfortably in 64px.
-  char buf[16];
-  u8g2->clearBuffer();
-  u8g2->setFont(u8g2_font_6x10_tr);
-
-  u8g2->setCursor(0, 9);
-  snprintf(buf, sizeof(buf), "rawGids: %u", rawGids);
-  u8g2->print(buf);
-
-  u8g2->setCursor(0, 19);
-  snprintf(buf, sizeof(buf), "rawSoc: %u", rawSoc);
-  u8g2->print(buf);
-
-  u8g2->setCursor(0, 29);
-  snprintf(buf, sizeof(buf), "SOC(BMS): %.1f%%", SocPct);
-  u8g2->print(buf);
-
-  u8g2->setCursor(0, 39);
-  snprintf(buf, sizeof(buf), "kWh: %.2f", kWh);
-  u8g2->print(buf);
-
-  u8g2->setCursor(0, 49);
-  snprintf(buf, sizeof(buf), "Range: %d km", range);
-  u8g2->print(buf);
-
-  u8g2->setCursor(0, 59);
-  unsigned long secsSinceRx = lastCanRxTime > 0 ? (millis() - lastCanRxTime) / 1000 : 0;
-  snprintf(buf, sizeof(buf), "CAN age: %lus", secsSinceRx);
-  u8g2->print(buf);
-
-  u8g2->sendBuffer();
-}
+// drawPage5 (Diagnostics) removed - this data now lives in the web portal's
+// "Diags" tab instead of taking up a physical OLED page. See server.on("/")
+// handler and the diagsHtml() helper below.
 
 // ============================================================
 // LED state machine
