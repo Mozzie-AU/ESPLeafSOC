@@ -134,6 +134,14 @@
 //         Diags tab includes a "Battery SOH" row, currently shows "--" since
 //         SOH (CAN 0x5B3, Car-CAN) isn't readable without the T-2CAN board -
 //         wired up ready to populate once that integration lands.
+//   v18 - Page 1: battery icon switched from battery_small (outline) to
+//         battery_solid. SOC% cursor nudged up one pixel row (62->61) to
+//         re-align with the new icon.
+//   v19 - Fixed bug from v18: SOC% text on page 1 was invisible (white-on-white)
+//         since it's drawn over the now-solid-white battery icon using the
+//         default draw colour. setDrawColor(0) added before the SOC% text so
+//         it renders as black ("cut out" of the white icon), with setDrawColor(1)
+//         restored immediately after for the rest of the page.
 
 // ============================================================
 // TODO:
@@ -159,7 +167,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v17"
+#define VERSION   "ESPLeafSOC v19"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -770,14 +778,19 @@ void drawPage1() {
   u8g2->print("m");
 
   // Battery outline graphic bottom left (56x24 starting at y=40)
-  u8g2->drawXBM(0, 40, 56, 24, battery_small_bits);
+  u8g2->drawXBM(0, 40, 56, 24, battery_solid_bits);
 
   // SOC% and kWh side by side on bottom line, SOC% inside battery outline footprint
   // SOC% now sourced directly from BMS (rawSoc/SocPct via CAN 0x55B) rather than
   // calculated from GIDS - the BMS already accounts for actual pack SoH, whereas
   // our GIDS-based calculation could not without knowing real current capacity.
+  // battery_solid_bits fills its footprint with white pixels, so the SOC% text
+  // drawn over it must be black (draw colour 0) to actually be visible - default
+  // white-on-white would otherwise be invisible. Draw colour is restored to 1
+  // (white/on) immediately after for the rest of the page.
   u8g2->setFont(u8g2_font_logisoso16_tr);
-  u8g2->setCursor(5, 62);
+  u8g2->setDrawColor(0);
+  u8g2->setCursor(5, 61);
   if (rawSoc != 0) {
     dtostrf(SocPct, 3, 0, buf);
     u8g2->print(buf);
@@ -785,6 +798,7 @@ void drawPage1() {
   } else {
     u8g2->print("---%");
   }
+  u8g2->setDrawColor(1);
   u8g2->setFont(u8g2_font_logisoso16_tr);
   u8g2->setCursor(62, 62);
   if (rawGids != 0) {
