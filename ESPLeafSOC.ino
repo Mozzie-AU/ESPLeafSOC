@@ -110,6 +110,17 @@
 //         call sites changed to u8g2->xxx() to support this. Driver choice is
 //         saved to NVS; changing it triggers ESP.restart() since the active
 //         object can only be selected during setup(), not swapped live.
+//   v16 - LED behaviour reworked. LED_CAN_OK/LED_NO_CAN merged into a single
+//         LED_CAN_STATUS state: a continuous gentle sine pulse whose colour
+//         blends smoothly from green (fresh data) to red (stale), based on
+//         elapsed time since the last CAN message versus CAN_TIMEOUT_MS.
+//         CAN_TIMEOUT_MS reduced from 5000 to 1500ms (3x the 500ms 0x5BC
+//         interval, the slower of our two CAN messages) so staleness shows
+//         up promptly rather than after a misleadingly long delay.
+//         LED_SAVED changed from a double white flash to a white pulse that
+//         fades smoothly to black over 3 seconds, then returns automatically
+//         to whichever state is appropriate (CAN status, or boot pulse if
+//         still mid-setup with no CAN data yet seen).
 
 // ============================================================
 // TODO:
@@ -135,7 +146,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v15"
+#define VERSION   "ESPLeafSOC v16"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -225,13 +236,12 @@ CRGB leds[WS2812_COUNT];
 
 // LED state machine
 enum LedState {
-  LED_BOOT,         // Blue slow pulse - booting / WiFi AP active
-  LED_CAN_OK,       // Green brief flash - CAN data receiving
-  LED_NO_CAN,       // Red slow blink - no CAN data (timeout)
-  LED_SAVED         // White double flash - settings saved
+  LED_BOOT,         // Blue slow pulse - booting / WiFi AP active, no CAN data yet
+  LED_CAN_STATUS,   // Continuous pulse, green->red blend based on data freshness
+  LED_SAVED         // White pulse and fade - settings just saved
 };
 LedState ledState = LED_BOOT;
-unsigned long ledLastUpdate = 0;
+unsigned long savedFlashStart = 0;   // when the LED_SAVED indication began
 
 // ------------------------------------------------------------
 // Runtime variables
@@ -245,7 +255,9 @@ float    kWh         = 0.0F; // energy remaining
 int      range       = 0;    // estimated range km
 
 unsigned long lastCanRxTime = 0;
-#define CAN_TIMEOUT_MS  5000  // ms without CAN data before LED goes red
+#define CAN_TIMEOUT_MS  1500  // ms without CAN data before LED fully reaches red
+                               // (3x the 500ms 0x5BC interval - the slower of our
+                               // two CAN messages, 0x5BC@500ms and 0x55B@100ms)
 
 // ------------------------------------------------------------
 // Settings (loaded from NVS on boot)
@@ -415,6 +427,7 @@ void saveSettings() {
   // Apply new rotation immediately without reboot
   u8g2->setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
   ledState = LED_SAVED;
+  savedFlashStart = millis();
   Serial.println("Settings saved to NVS");
 }
 
@@ -453,7 +466,7 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     range = (int)(kmPerKwh * ((rawGids - GIDS_TURTLE) * WH_PER_GID) / 1000.0F);
 
     lastCanRxTime = millis();
-    ledState = LED_CAN_OK;
+    if (ledState != LED_SAVED) ledState = LED_CAN_STATUS;
 
   } else if (id == 0x55B) {
     // SOC% direct from BMS (100ms interval) - primary displayed value.
@@ -462,6 +475,9 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     // (CAN 0x5B3, Car-CAN bus - see T-2CAN project notes).
     rawSoc  = (data[0] << 2) | (data[1] >> 6);
     SocPct  = rawSoc / 10.0F;
+
+    lastCanRxTime = millis();
+    if (ledState != LED_SAVED) ledState = LED_CAN_STATUS;
   }
 }
 
@@ -621,7 +637,14 @@ void stopWifi() {
   WiFi.softAPdisconnect(true);
   wifiActive = false;
   Serial.println("WiFi AP stopped");
-  if (ledState == LED_BOOT) ledState = LED_NO_CAN;
+  // Leave boot/blue pulse only if no CAN data has ever been seen yet -
+  // otherwise the CAN status pulse (set in processCanMessage) already applies.
+  if (ledState == LED_BOOT && lastCanRxTime == 0) {
+    // Stay blue a little longer is pointless once WiFi is off with no CAN -
+    // switch to status mode now; updateLed() will show it as fully red
+    // since lastCanRxTime is 0 (treated as "never received").
+    ledState = LED_CAN_STATUS;
+  }
 }
 
 // ============================================================
@@ -815,53 +838,65 @@ void drawPage5() {
 // ============================================================
 // LED state machine
 // ============================================================
+// LED_BOOT       - blue sine pulse, shown until the very first CAN message
+//                  arrives (or indefinitely if none ever does)
+// LED_CAN_STATUS - continuous sine pulse, colour blends from green (fresh
+//                  data) to red (stale/no data) based on how long it's been
+//                  since the last CAN message. No more discrete on/off states -
+//                  the colour itself tells you the story at a glance.
+// LED_SAVED      - brief white pulse that fades out over ~3 seconds, then
+//                  automatically returns to LED_CAN_STATUS
+// ============================================================
+#define LED_SAVED_FADE_MS  3000   // how long the white "settings saved" fade lasts
+
 void updateLed() {
   unsigned long now = millis();
 
-  // Check for CAN timeout
-  if (lastCanRxTime > 0 && (now - lastCanRxTime > CAN_TIMEOUT_MS)) {
-    if (ledState == LED_CAN_OK) ledState = LED_NO_CAN;
-  }
-
   switch (ledState) {
     case LED_BOOT: {
-      // Blue slow pulse using sine wave
+      // Blue slow pulse using sine wave - shown until first CAN message
       uint8_t brightness = (uint8_t)(127.5F + 127.5F * sin(now / 500.0F));
       leds[0] = CRGB(0, 0, brightness);
       FastLED.show();
       break;
     }
-    case LED_CAN_OK: {
-      // Brief green flash, then off
-      if (now - ledLastUpdate < 80) {
-        leds[0] = CRGB::Green;
+
+    case LED_CAN_STATUS: {
+      // Continuous gentle pulse (same sine shape as boot) - colour blends
+      // from green (data arriving within CAN_TIMEOUT_MS) to red (stale).
+      // lastCanRxTime == 0 (never received) is treated as fully stale/red.
+      float staleness;
+      if (lastCanRxTime == 0) {
+        staleness = 1.0F;
       } else {
-        leds[0] = CRGB::Black;
+        unsigned long age = now - lastCanRxTime;
+        staleness = (float)age / (float)CAN_TIMEOUT_MS;
+        staleness = constrain(staleness, 0.0F, 1.0F);
       }
-      FastLED.show();
-      ledLastUpdate = now;
-      ledState = LED_NO_CAN;  // return to timeout watch after flash
-      break;
-    }
-    case LED_NO_CAN: {
-      // Red slow blink 1Hz
-      leds[0] = ((now / 500) % 2 == 0) ? CRGB::Red : CRGB::Black;
+      uint8_t redComponent   = (uint8_t)(255.0F * staleness);
+      uint8_t greenComponent = (uint8_t)(255.0F * (1.0F - staleness));
+
+      // Sine pulse brightness, same feel as the boot pulse
+      float pulse = 0.4F + 0.6F * (0.5F + 0.5F * sin(now / 500.0F));
+      leds[0] = CRGB((uint8_t)(redComponent * pulse), (uint8_t)(greenComponent * pulse), 0);
       FastLED.show();
       break;
     }
+
     case LED_SAVED: {
-      // White double flash then return to previous state
-      static uint8_t flashCount = 0;
-      if (now - ledLastUpdate > 150) {
-        leds[0] = (flashCount % 2 == 0) ? CRGB::White : CRGB::Black;
-        FastLED.show();
-        flashCount++;
-        ledLastUpdate = now;
-        if (flashCount >= 4) {
-          flashCount = 0;
-          ledState = (lastCanRxTime > 0) ? LED_NO_CAN : LED_BOOT;
-        }
+      // White pulse fading out over LED_SAVED_FADE_MS, then back to status mode
+      unsigned long elapsed = now - savedFlashStart;
+      if (elapsed >= LED_SAVED_FADE_MS) {
+        // Stay on the blue boot pulse only if WiFi portal is still open and
+        // no CAN data has ever been seen - otherwise show CAN status (which
+        // correctly renders fully red if lastCanRxTime is still 0).
+        ledState = (wifiActive && lastCanRxTime == 0) ? LED_BOOT : LED_CAN_STATUS;
+        break;
       }
+      float fadeFraction = 1.0F - ((float)elapsed / (float)LED_SAVED_FADE_MS);
+      uint8_t brightness = (uint8_t)(255.0F * fadeFraction);
+      leds[0] = CRGB(brightness, brightness, brightness);
+      FastLED.show();
       break;
     }
   }
