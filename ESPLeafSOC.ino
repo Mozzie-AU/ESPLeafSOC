@@ -103,6 +103,13 @@
 //         remain GIDS-based (CAN 0x5BC). Web portal simplified to: display page,
 //         km/kWh, display rotation. NVS keys for pack type/maxGids no longer
 //         written; any previously stored values are simply ignored.
+//   v15 - OLED driver chip (SH1106/SSD1306) now selectable from the web portal
+//         instead of a code recompile + reflash. Both U8G2 display objects are
+//         instantiated; "u8g2" is now a U8G2* base-class pointer set in setup()
+//         to whichever object matches the saved NVS setting. All u8g2.xxx()
+//         call sites changed to u8g2->xxx() to support this. Driver choice is
+//         saved to NVS; changing it triggers ESP.restart() since the active
+//         object can only be selected during setup(), not swapped live.
 
 // ============================================================
 // TODO:
@@ -128,7 +135,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v14"
+#define VERSION   "ESPLeafSOC v15"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -185,6 +192,7 @@
 #define NVS_PAGE        "page"
 #define NVS_KM_PER_KWH  "kmkwh"
 #define NVS_ROTATION    "rotation"
+#define NVS_OLED_DRIVER "oleddrv"
 
 // ------------------------------------------------------------
 // Display constructor
@@ -192,20 +200,23 @@
 // Hardware SPI - CLK=33, MOSI=32, CS=25, DC=18, RST=35
 // U8G2_R0 = no rotation, U8G2_R2 = 180 degrees (match your physical mount)
 //
-// Display rotation is now set at runtime from NVS via u8g2.setDisplayRotation()
-// Constructor always uses U8G2_R0 - rotation applied in setup() after loadSettings()
+// Display rotation is set at runtime from NVS via u8g2->setDisplayRotation()
+// Constructors always use U8G2_R0 - rotation applied in setup() after loadSettings()
 //
-// Uncomment the line matching your display's driver chip.
-// Existing Keyestudio installs: SH1106 (default)
-// Seeedstudio and some others:  SSD1306
+// Driver chip (SH1106 / SSD1306) is also selected at runtime from NVS, chosen
+// via the web portal. Both display objects exist; u8g2 is a pointer to the
+// common U8G2 base class, set to whichever object setup() decides to use.
+// Changing driver type in the portal triggers a reboot to take effect.
 
-// SH1106 128x64 SPI - Keyestudio KS0056 and compatible (DEFAULT)
-U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
+U8G2_SH1106_128X64_NONAME_F_4W_HW_SPI u8g2_sh1106(U8G2_R0,
   /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
 
-// SSD1306 128x64 SPI - Seeedstudio and compatible (uncomment if needed)
-// U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2(U8G2_R0,
-//   /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
+U8G2_SSD1306_128X64_NONAME_F_4W_HW_SPI u8g2_ssd1306(U8G2_R0,
+  /* cs=*/ OLED_CS_PIN, /* dc=*/ OLED_DC_PIN, /* reset=*/ OLED_RST_PIN);
+
+// Pointer to whichever display object is active - set in setup() from NVS.
+// All draw functions call u8g2->method() instead of u8g2->method().
+U8G2* u8g2 = &u8g2_sh1106;
 
 // ------------------------------------------------------------
 // LED
@@ -245,6 +256,7 @@ int      displayPage    = 1;
 float    kmPerKwh       = 6.4F;
 // packType and maxGids removed in v14 - no longer needed for SOC% calculation
 int      displayRotation = 2;     // 0 = normal, 2 = 180 degrees (U8G2_R0 / U8G2_R2)
+int      oledDriver      = 0;     // 0 = SH1106 (default, Keyestudio), 1 = SSD1306 (Seeedstudio)
 
 // Test mode - cycles display pages for layout checking (not saved to NVS)
 bool     testMode          = false;
@@ -298,21 +310,24 @@ void setup() {
   // Load settings from NVS
   loadSettings();
 
+  // Select OLED driver object based on saved setting (default SH1106)
+  u8g2 = (oledDriver == 1) ? (U8G2*)&u8g2_ssd1306 : (U8G2*)&u8g2_sh1106;
+
   // OLED init - hardware SPI on custom pins
   SPI.begin(OLED_CLK_PIN, -1, OLED_MOSI_PIN, OLED_CS_PIN);
-  u8g2.begin();
+  u8g2->begin();
   // Apply rotation from NVS setting (0=normal, 2=180 degrees)
-  u8g2.setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
+  u8g2->setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
 
   // Splash screen - 12px line spacing fits 5 lines within 64px height
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(0, 10);  u8g2.print(VERSION);
-  u8g2.setCursor(0, 22);  u8g2.print("Original: Paul Kennett");
-  u8g2.setCursor(0, 34);  u8g2.print(DATE);
-  u8g2.setCursor(0, 46);  u8g2.print(AUTHOR);
-  u8g2.setCursor(0, 58);  u8g2.print("github.com/Mozzie-AU");
-  u8g2.sendBuffer();
+  u8g2->clearBuffer();
+  u8g2->setFont(u8g2_font_6x10_tr);
+  u8g2->setCursor(0, 10);  u8g2->print(VERSION);
+  u8g2->setCursor(0, 22);  u8g2->print("Original: Paul Kennett");
+  u8g2->setCursor(0, 34);  u8g2->print(DATE);
+  u8g2->setCursor(0, 46);  u8g2->print(AUTHOR);
+  u8g2->setCursor(0, 58);  u8g2->print("github.com/Mozzie-AU");
+  u8g2->sendBuffer();
 
   // Start WiFi config portal
   initWifi();
@@ -380,10 +395,14 @@ void loadSettings() {
   displayRotation = prefs.getInt(NVS_ROTATION, 2);
   if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
 
+  // Load OLED driver type (0=SH1106, 1=SSD1306)
+  oledDriver = prefs.getInt(NVS_OLED_DRIVER, 0);
+  if (oledDriver != 0 && oledDriver != 1) oledDriver = 0;
+
   prefs.end();
 
-  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f rotation=%d\n",
-                displayPage, kmPerKwh, displayRotation);
+  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f rotation=%d oledDriver=%d\n",
+                displayPage, kmPerKwh, displayRotation, oledDriver);
 }
 
 void saveSettings() {
@@ -391,9 +410,10 @@ void saveSettings() {
   prefs.putInt(NVS_PAGE, displayPage);
   prefs.putFloat(NVS_KM_PER_KWH, kmPerKwh);
   prefs.putInt(NVS_ROTATION, displayRotation);
+  prefs.putInt(NVS_OLED_DRIVER, oledDriver);
   prefs.end();
   // Apply new rotation immediately without reboot
-  u8g2.setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
+  u8g2->setDisplayRotation(displayRotation == 2 ? U8G2_R2 : U8G2_R0);
   ledState = LED_SAVED;
   Serial.println("Settings saved to NVS");
 }
@@ -496,6 +516,14 @@ void initWifi() {
       "</select>"
       "<div class='info'>Match your physical display mount orientation.</div>"
 
+      "<label>OLED Driver Chip</label>"
+      "<select name='oleddrv'>"
+      "<option value='0'" + String(oledDriver==0?" selected":"") + ">SH1106 (Keyestudio - default)</option>"
+      "<option value='1'" + String(oledDriver==1?" selected":"") + ">SSD1306 (Seeedstudio)</option>"
+      "</select>"
+      "<div class='info'>Match your physical OLED module. "
+      "Changing this restarts the device to apply.</div>"
+
       "<input type='submit' value='Save Settings'>"
       "</form>"
 
@@ -525,8 +553,32 @@ void initWifi() {
       displayRotation = request->getParam("rotation", true)->value().toInt();
       if (displayRotation != 0 && displayRotation != 2) displayRotation = 2;
     }
+    bool driverChanged = false;
+    if (request->hasParam("oleddrv", true)) {
+      int newDriver = request->getParam("oleddrv", true)->value().toInt();
+      if (newDriver != 0 && newDriver != 1) newDriver = 0;
+      if (newDriver != oledDriver) {
+        oledDriver = newDriver;
+        driverChanged = true;
+      }
+    }
     saveSettings();
     displayNeedsUpdate = true;       // main loop handles display refresh
+
+    if (driverChanged) {
+      // OLED driver class can't be swapped without re-running setup() -
+      // restart the device so it boots using the newly selected driver.
+      request->send(200, "text/html",
+        "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
+        "<h2 style='color:#a62'>Restarting...</h2>"
+        "<p>OLED driver changed. Device is restarting to apply this - "
+        "give it a few seconds, then reconnect to the WiFi portal if needed.</p>"
+        "</body></html>");
+      delay(500);   // let the response actually get sent before rebooting
+      ESP.restart();
+      return;
+    }
+
     request->send(200, "text/html",
       "<html><body style='font-family:sans-serif;max-width:400px;margin:20px auto'>"
       "<h2 style='color:#2a6'>Settings Saved</h2>"
@@ -593,57 +645,57 @@ void drawPage1() {
   //   battery_small outline bottom left, SOC% inside battery footprint (x=5),
   //   kWh alongside at x=62, both on bottom line y=62.
   char buf[8];
-  u8g2.clearBuffer();
+  u8g2->clearBuffer();
 
   // "Range" label top left - medium font
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 34);
-  u8g2.print("Range");
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(0, 34);
+  u8g2->print("Range");
 
   // Large range number - centre top area
-  u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(50, 38);
+  u8g2->setFont(u8g2_font_logisoso32_tn);
+  u8g2->setCursor(50, 38);
   if (rawGids != 0) {
     dtostrf(range, 3, 0, buf);
-    u8g2.print(buf);
+    u8g2->print(buf);
   } else {
-    u8g2.print("---");
+    u8g2->print("---");
   }
 
   // "km" stacked vertically right edge
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(111, 20);
-  u8g2.print("k");
-  u8g2.setCursor(111, 36);
-  u8g2.print("m");
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(111, 20);
+  u8g2->print("k");
+  u8g2->setCursor(111, 36);
+  u8g2->print("m");
 
   // Battery outline graphic bottom left (56x24 starting at y=40)
-  u8g2.drawXBM(0, 40, 56, 24, battery_small_bits);
+  u8g2->drawXBM(0, 40, 56, 24, battery_small_bits);
 
   // SOC% and kWh side by side on bottom line, SOC% inside battery outline footprint
   // SOC% now sourced directly from BMS (rawSoc/SocPct via CAN 0x55B) rather than
   // calculated from GIDS - the BMS already accounts for actual pack SoH, whereas
   // our GIDS-based calculation could not without knowing real current capacity.
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(5, 62);
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(5, 62);
   if (rawSoc != 0) {
     dtostrf(SocPct, 3, 0, buf);
-    u8g2.print(buf);
-    u8g2.print("%");
+    u8g2->print(buf);
+    u8g2->print("%");
   } else {
-    u8g2.print("---%");
+    u8g2->print("---%");
   }
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(62, 62);
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(62, 62);
   if (rawGids != 0) {
     dtostrf(kWh, 4, 1, buf);
-    u8g2.print(buf);
-    u8g2.print("kWh");
+    u8g2->print(buf);
+    u8g2->print("kWh");
   } else {
-    u8g2.print("--.-kWh");
+    u8g2->print("--.-kWh");
   }
 
-  u8g2.sendBuffer();
+  u8g2->sendBuffer();
 }
 
 void drawPage2() {
@@ -652,112 +704,112 @@ void drawPage2() {
   // see commented print calls below, Ray's choice to avoid clutter/overlap)
   // kWh below battery graphic at y=62, full 64px available
   char buf[8];
-  u8g2.clearBuffer();
+  u8g2->clearBuffer();
 
   // Battery large outline graphic - full width, top of screen
-  u8g2.drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
+  u8g2->drawXBMP(0, 0, bitmap_width, bitmap_height, battery_large_bits);
 
   // SOC% inside battery - logisoso26 numerals
   // Sourced directly from BMS (rawSoc/SocPct via CAN 0x55B) - see page 1 comment.
   // Battery interior roughly x=10 to x=118, y=4 to y=37
-  u8g2.setFont(u8g2_font_logisoso26_tn);
-  u8g2.setCursor(28, 32);
+  u8g2->setFont(u8g2_font_logisoso26_tn);
+  u8g2->setCursor(28, 32);
   if (rawSoc != 0) {
     dtostrf(SocPct, 3, 0, buf);
-    u8g2.print(buf);
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.setCursor(90, 28);
-    //u8g2.print("%");
+    u8g2->print(buf);
+    u8g2->setFont(u8g2_font_6x10_tr);
+    u8g2->setCursor(90, 28);
+    //u8g2->print("%");
   } else {
-    u8g2.print("---");
-    u8g2.setFont(u8g2_font_6x10_tr);
-    u8g2.setCursor(90, 28);
-    //u8g2.print("%");
+    u8g2->print("---");
+    u8g2->setFont(u8g2_font_6x10_tr);
+    u8g2->setCursor(90, 28);
+    //u8g2->print("%");
   }
 
   // kWh below battery - medium font, y=62 full 64px available
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(20, 62);
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(20, 62);
   if (rawGids != 0) {
     dtostrf(kWh, 4, 1, buf);
-    u8g2.print(buf);
-    u8g2.print(" kWh");
+    u8g2->print(buf);
+    u8g2->print(" kWh");
   } else {
-    u8g2.print(" --.- kWh");
+    u8g2->print(" --.- kWh");
   }
-  u8g2.sendBuffer();
+  u8g2->sendBuffer();
 }
 
 void drawPage3() {
   // Range only - large number centre screen
   // "Range" top left, "km" top right, large number centre
   char buf[8];
-  u8g2.clearBuffer();
+  u8g2->clearBuffer();
 
   // "Range" top left, "km" top right - medium font, baseline y=16
-  u8g2.setFont(u8g2_font_logisoso16_tr);
-  u8g2.setCursor(0, 16);
-  u8g2.print("Range");
-  u8g2.setCursor(103, 16);
-  u8g2.print("km");
+  u8g2->setFont(u8g2_font_logisoso16_tr);
+  u8g2->setCursor(0, 16);
+  u8g2->print("Range");
+  u8g2->setCursor(103, 16);
+  u8g2->print("km");
 
   // Large range number - full 64px available, baseline y=62
-  u8g2.setFont(u8g2_font_logisoso32_tn);
-  u8g2.setCursor(44, 62);
+  u8g2->setFont(u8g2_font_logisoso32_tn);
+  u8g2->setCursor(44, 62);
   if (rawGids != 0) {
     dtostrf(range, 3, 0, buf);
-    u8g2.print(buf);
+    u8g2->print(buf);
   } else {
-    u8g2.print("---");
+    u8g2->print("---");
   }
-  u8g2.sendBuffer();
+  u8g2->sendBuffer();
 }
 
 void drawPage4() {
   // Version info - small font, 12px spacing fits 5 lines in 64px
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr);
-  u8g2.setCursor(0, 10);  u8g2.print(VERSION);
-  u8g2.setCursor(0, 22);  u8g2.print("Paul Kennett (original)");
-  u8g2.setCursor(0, 34);  u8g2.print(DATE);
-  u8g2.setCursor(0, 46);  u8g2.print(AUTHOR);
-  u8g2.setCursor(0, 58);  u8g2.print("github.com/Mozzie-AU");
-  u8g2.sendBuffer();
+  u8g2->clearBuffer();
+  u8g2->setFont(u8g2_font_6x10_tr);
+  u8g2->setCursor(0, 10);  u8g2->print(VERSION);
+  u8g2->setCursor(0, 22);  u8g2->print("Paul Kennett (original)");
+  u8g2->setCursor(0, 34);  u8g2->print(DATE);
+  u8g2->setCursor(0, 46);  u8g2->print(AUTHOR);
+  u8g2->setCursor(0, 58);  u8g2->print("github.com/Mozzie-AU");
+  u8g2->sendBuffer();
 }
 
 void drawPage5() {
   // Diagnostics page - raw values for bench testing.
   // Small font, lines at 10px spacing fit comfortably in 64px.
   char buf[16];
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2->clearBuffer();
+  u8g2->setFont(u8g2_font_6x10_tr);
 
-  u8g2.setCursor(0, 9);
+  u8g2->setCursor(0, 9);
   snprintf(buf, sizeof(buf), "rawGids: %u", rawGids);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.setCursor(0, 19);
+  u8g2->setCursor(0, 19);
   snprintf(buf, sizeof(buf), "rawSoc: %u", rawSoc);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.setCursor(0, 29);
+  u8g2->setCursor(0, 29);
   snprintf(buf, sizeof(buf), "SOC(BMS): %.1f%%", SocPct);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.setCursor(0, 39);
+  u8g2->setCursor(0, 39);
   snprintf(buf, sizeof(buf), "kWh: %.2f", kWh);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.setCursor(0, 49);
+  u8g2->setCursor(0, 49);
   snprintf(buf, sizeof(buf), "Range: %d km", range);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.setCursor(0, 59);
+  u8g2->setCursor(0, 59);
   unsigned long secsSinceRx = lastCanRxTime > 0 ? (millis() - lastCanRxTime) / 1000 : 0;
   snprintf(buf, sizeof(buf), "CAN age: %lus", secsSinceRx);
-  u8g2.print(buf);
+  u8g2->print(buf);
 
-  u8g2.sendBuffer();
+  u8g2->sendBuffer();
 }
 
 // ============================================================
