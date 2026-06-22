@@ -152,13 +152,44 @@
 //         7 bits, 0-100 direct: rawSoh = (data[4] >> 1) & 0x7F.
 //         Diags tab "Battery SOH" row now shows the real live value instead
 //         of the "--" placeholder.
+//   v21 - SoH reads as a whole percent (e.g. 88%) but LeafSpy shows one decimal
+//         (88.1%). DEBUG: capturing bit 0 of data[4] (rawSohBit0, surfaced as
+//         "SOH bit0 (dbg)" on the Diags tab) to test whether SoH is actually an
+//         8-bit field (0-200, 0.5% steps) and we've been discarding its LSB.
+//         To remove once confirmed either way - correlate this bit against
+//         LeafSpy's displayed decimal over several readings.
+//         km per kWh setup field precision increased from 1 to 2 decimal
+//         places (step 0.1 -> 0.01) for finer efficiency tuning.
+//   v22 - Release prep. Removed the SoH debug bit investigation from v21 -
+//         live testing showed it toggling with no clean correlation to
+//         LeafSpy's decimal SoH reading, so it isn't part of the field after
+//         all. Whole-percent SoH (rawSoh) remains as the production decode.
+//         No functional changes beyond debug code removal - this version is
+//         intended as the first GitHub release candidate.
+//   v23 - TODO list cleaned up: removed the T-2CAN dual-bus SoH item (no longer
+//         needed - SoH is decoded directly from existing CAN 0x5BC, see v20)
+//         and the WH_PER_GID verification item (75 vs 80 - settled on 75 for
+//         usable-energy range/kWh, no longer flagged as outstanding).
+//         WH_PER_GID itself is unchanged and still in active use for kWh/range.
+//         Stale in-code comment on the 0x55B handler updated - it previously
+//         said SoH needed the T-2CAN board; it's actually decoded right there
+//         in the 0x5BC handler above it, as of v20.
+//
+//   --- Versioning note ---
+//   v01-v23 above were development/test builds, each flashed and verified on
+//   real hardware as the project progressed - kept as-is rather than
+//   renumbered, since they're an honest record of what was actually tested
+//   under each name. From here on, version numbers follow a more conventional
+//   x.y scheme: v1.0 marks the first release considered feature-complete and
+//   stable enough for general use.
+//
+//   v1.0 - First public release. Functionally identical to v23 - this version
+//          bump exists purely to mark the v01-v23 development series as
+//          complete and draw a clean line for the GitHub release.
 
 // ============================================================
 // TODO:
 //   1. Verify GIDS decode bit-shift for 0x5BC matches your Leaf model year
-//   2. Implement T-2CAN dual-bus SoH (0x5B3) integration once board arrives -
-//      maxGids = packTypeFullGids * (SoH/100), replacing fixed preset
-//   3. Verify WH_PER_GID (75 vs 80) against live data once CAN testing begins
 // ============================================================
 
 #include <Arduino.h>
@@ -177,7 +208,7 @@
 // ------------------------------------------------------------
 // Version
 // ------------------------------------------------------------
-#define VERSION   "ESPLeafSOC v20"
+#define VERSION   "ESPLeafSOC v1.0"
 #define DATE      "June 2026"
 #define AUTHOR    "Mozzie-AU"
 
@@ -444,7 +475,7 @@ void loadSettings() {
 
   prefs.end();
 
-  Serial.printf("Settings loaded: page=%d kmPerKwh=%.1f rotation=%d oledDriver=%d\n",
+  Serial.printf("Settings loaded: page=%d kmPerKwh=%.2f rotation=%d oledDriver=%d\n",
                 displayPage, kmPerKwh, displayRotation, oledDriver);
 }
 
@@ -500,6 +531,11 @@ void processCanMessage(uint32_t id, uint8_t* data) {
     // DBC: SG_ LB_Capacity_Deterioration_Rate : 33|7@1+ (1,0) [0|100] "%"
     // (dalathegreat/leaf_can_bus_messages, EV-can_ZE0.dbc, message 0x5BC/1468)
     // Intel(@1) format, start bit 33 -> byte 4, bit 1; 7 bits, 0-100 direct.
+    // Note: LeafSpy shows SoH to one decimal place (e.g. 88.5%); we only get
+    // whole percent. Investigated whether the adjacent bit (data[4] bit 0)
+    // carried the missing fractional resolution - it toggled with no clean
+    // correlation to LeafSpy's decimal, so it isn't part of this field after
+    // all. Whole-percent SoH is good enough for this project's purposes.
     rawSoh = (data[4] >> 1) & 0x7F;
 
     lastCanRxTime = millis();
@@ -507,9 +543,9 @@ void processCanMessage(uint32_t id, uint8_t* data) {
 
   } else if (id == 0x55B) {
     // SOC% direct from BMS (100ms interval) - primary displayed value.
-    // The BMS already accounts for actual pack State of Health, which a
-    // GIDS-based calculation cannot do without a separate SoH reading
-    // (CAN 0x5B3, Car-CAN bus - see T-2CAN project notes).
+    // The BMS already accounts for actual pack State of Health (SoH), which
+    // a GIDS-based calculation alone could not do reliably. SoH itself is
+    // decoded separately from CAN 0x5BC - see rawSoh in the block above.
     rawSoc  = (data[0] << 2) | (data[1] >> 6);
     SocPct  = rawSoc / 10.0F;
 
@@ -581,8 +617,8 @@ void initWifi() {
       "</select>"
 
       "<label>km per kWh</label>"
-      "<input type='number' name='kmkwh' min='1' max='20' step='0.1' value='"
-      + String(kmPerKwh, 1) + "'>"
+      "<input type='number' name='kmkwh' min='1' max='20' step='0.01' value='"
+      + String(kmPerKwh, 2) + "'>"
       "<div class='info'>Your average efficiency. Used to calculate range estimate.</div>"
 
       "<label>Display Rotation</label>"
