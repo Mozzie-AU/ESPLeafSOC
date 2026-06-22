@@ -6,6 +6,8 @@ This is an ESP32 refactor of [Paul Kennett's LeafSOCdisplay](https://github.com/
 
 This build also supports ZE0s that have been retrofitted with larger aftermarket battery packs (30/40/62kWh) via community CAN-bridge adapters.
 
+![ESPLeafSOC display](./Images/ESPLeafSOC-Display.jpg)
+
 ---
 
 ## What's different from Paul's original
@@ -107,6 +109,8 @@ The WiFi portal stays open for 60 seconds after you last interact with it, then 
 
 ### Setup tab
 
+![Setup tab](./Images/Setup-Tab.png)
+
 | Setting | What it does |
 |---|---|
 | Display Page | Which of the 4 OLED pages to show during normal driving |
@@ -115,6 +119,8 @@ The WiFi portal stays open for 60 seconds after you last interact with it, then 
 | OLED Driver Chip | SH1106 or SSD1306 — match your actual display module. Changing this restarts the device. |
 
 ### Diags tab
+
+![Diags tab](./Images/Diags-Tab.png)
 
 Live readouts, refreshing once a second:
 
