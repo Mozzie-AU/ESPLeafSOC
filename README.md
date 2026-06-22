@@ -161,6 +161,8 @@ hardware/
 └── case/             3D-printable housing/case STL files
 ```
 
+Full parts list, including the OLED adapter's connectors, is in [`BOM.md`](./hardware/BOM.md).
+
 The case STL files are being redesigned to suit the T-CAN485 board and the OLED adapter — check this folder for the latest version rather than relying on a fixed file name, as it may change between releases.
 
 ---
