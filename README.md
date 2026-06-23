@@ -43,6 +43,8 @@ This adapter is entirely optional — it just saves you re-pinning or re-solderi
 
 ## Wiring
 
+![ESPLeafSOC wiring diagram](./Images/ESPLeafSOC-Wiring.svg)
+
 ### OBD2 connector (power and EV-CAN)
 
 | OBD2 pin | Connects to | Purpose |
